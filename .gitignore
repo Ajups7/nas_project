@@ -1,0 +1,13 @@
+# Claude Code session/tooling state - not project content
+.claude/
+
+# Data lives on the shared VM, not in git - see SETUP.md
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+scripts/__pycache__/
+
