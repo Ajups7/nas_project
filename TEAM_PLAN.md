@@ -19,6 +19,58 @@ else below can proceed independently once this is settled.
 Suggested join keys: `(airport, date, local_hour, gmt_hour)` — matches the
 grouping already used across all four downloaded datasets.
 
+## Temporal split — PROPOSED, needs Person A + Person B sign-off
+
+The second shared Phase 0 decision: fixed train/validation/test date
+boundaries, used identically by all three tiers (so results are comparable
+across tiers later, in the Phase 4 validation framework). **Not yet
+agreed** — the below is Person C's concrete proposal, implemented as a
+reusable function so it can be checked mechanically rather than agreed on
+by eyeballing a calendar: [`common/temporal_split.py`](common/temporal_split.py)'s
+`assign_temporal_split()`, validated in
+[`common/validate_temporal_split.py`](common/validate_temporal_split.py).
+
+**Why this needs an embargo gap, not just three adjacent date ranges**: the
+Planning tier's label looks forward up to 30 days from any date. Without a
+gap between splits, a training example near the boundary would have its
+label computed from data that's actually inside the validation set — a real
+leak. The embargo is a dead zone between splits, sized to at least the
+longest horizon of any tier (**30 days — Planning's own**, which makes it
+the binding constraint for all three of you, even though Tactical/Strategic
+have much shorter horizons).
+
+**Lesson already learned building this**: an earlier draft of this proposal
+picked embargo boundaries by hand, rounding to "the rest of the calendar
+month." That was actually wrong — checked mechanically, a validation date of
+2024-01-31 has a 30-day label window reaching to 2024-03-01, but the
+hand-rounded proposal started the test set on exactly that date — a 1-day
+leak, caused by February 2024 being a leap year (29 days: one short of the
+required 30). `assign_temporal_split()` computes the exact day-based gap
+instead of rounding to calendar months, so this class of mistake can't
+happen again.
+
+**Concrete proposed boundaries** (`assign_temporal_split(dates, train_end="2022-12-31", validation_end="2024-01-30", embargo_days=30)`):
+
+| Bucket | Range | Days |
+|---|---|---|
+| train | 2016-01-01 → 2022-12-31 | 2,557 (~7 yr) |
+| embargo | 2023-01-01 → 2023-01-30 | 30 |
+| validation | 2023-01-31 → 2024-01-30 | 365 (~1 yr) |
+| embargo | 2024-01-31 → 2024-02-29 | 30 |
+| test | 2024-03-01 → 2026-01-31 | 702 (~1.9 yr) |
+
+Test is deliberately ~2 years, not a short holdout: Planning-tier features
+are climatology-based (seasonal patterns — see `features/planning.py`), so
+a short test window would only ever validate against one season.
+
+Known data gaps (2016-07 and 2025-09 EDCT — see README.md) fall inside
+train and test respectively; neither lands on a boundary, so they don't
+interact with the embargo logic.
+
+**Next step**: Person A and Person B review the function + boundaries above
+and confirm, adjust `train_end`/`validation_end`, or raise concerns — once
+agreed, this becomes locked shared infrastructure like `common/data_loader.py`.
+
 ## Person A — Tactical tier (0-2h) + Baseline Models
 
 - Feature engineering at hourly granularity for the tactical horizon
@@ -61,9 +113,9 @@ grouping already used across all four downloaded datasets.
 ## Workflow
 
 - Each person works on their own branch, in their own tier's directory.
-- Shared utilities (`rotation_graph.py`, `faoc_loss.py`, the feature schema)
-  change rarely once agreed — treat changes to them as a heads-up to the
-  other two before merging.
+- Shared utilities (`rotation_graph.py`, `faoc_loss.py`, `temporal_split.py`,
+  the feature schema) change rarely once agreed — treat changes to them as a
+  heads-up to the other two before merging.
 - Regular short syncs (even async, e.g. a shared doc or channel) to confirm
   the shared feature schema hasn't silently drifted between tiers.
 - PRs reviewed by at least one other teammate before merging to main.

@@ -2,3 +2,8 @@ requests
 playwright
 pandas
 lxml
+html5lib
+beautifulsoup4
+statsmodels
+torch
+matplotlib
