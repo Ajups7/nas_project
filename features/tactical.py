@@ -14,17 +14,25 @@ both a rolling MEAN over the trailing WINDOW_HOURS and a rolling DELTA
 what actually signals "getting worse right now" versus "has been like
 this all day," which a plain rolling mean can't distinguish.
 
-Weather is joined on `gmt_hour` (confirmed present in load_weather()'s
-output - schema.md only documents `local_hour_approx`, but the loader
-exposes an exact `gmt_hour` too), never `local_hour_approx`.
+Weather is joined on `gmt_hour` for MERGING with operational/EDCT rows
+(exact cross-source key match, unaffected by ordering).
 
-The lightweight rotation signal (step 3) is mean inbound ArrDelay from
-BTS, NOT the full rotation-chain graph (features/rotation_graph.py is
-Person B's shared utility for that - see TEAM_PLAN.md, "tier-local work"
-vs "shared utility"). It's joined on `local_hour`, not `gmt_hour` - BTS's
-ArrTime is already local to the Dest airport (no cross-airport timezone
-conversion needed here, unlike weather), but BTS gives no gmt_hour
-equivalent directly.
+IMPORTANT - rolling-window sort key uses LOCAL hour, not gmt_hour: an
+earlier version built its chronological sort key as
+`date + timedelta(hours=gmt_hour)`, which is only valid for an airport at
+UTC+0. For any real airport (e.g. ATL, UTC-4/-5), gmt_hour wraps past
+midnight partway through the LOCAL day - `date` stays the same while
+gmt_hour resets to 0 - creating a large backward jump in the middle of
+every single day and corrupting every rolling window's ordering. Fixed by
+sorting on `date + local_hour` instead (`local_hour_approx` for weather,
+since load_weather() has no exact local_hour): local_hour resets to 0
+exactly when `date` increments (that's what "local hour" means), so this
+is monotonic by construction across every local midnight, with one small
+known exception - the two days a year with a DST transition, where local
+wall-clock hours briefly skip or repeat. Not corrected for here, same
+"document the approximation" spirit as schema.md's own local_hour_approx
+note, and a far smaller issue than the bug it replaced (wrong every
+single day, not two days a year).
 
 NOTE: common/temporal_split.py is still an unsigned-off PROPOSAL as of
 this writing (see that file's own docstring) - Step 4 of this build
@@ -46,13 +54,17 @@ EDCT_NUMERIC_COLS = [
 ]
 
 
-def _airport_hour_index(dates: pd.Series, gmt_hours: pd.Series) -> pd.Series:
-    """Collapses (date, gmt_hour) into one sortable UTC timestamp, used
-    internally for rolling windows - never exposed in output tables,
-    which keep date/local_hour/gmt_hour as separate columns per
-    schema.md's convention."""
+def _local_sort_key(dates: pd.Series, local_hours: pd.Series) -> pd.Series:
+    """Collapses (date, local_hour) into one sortable value, used
+    internally to put a single airport's rows in correct LOCAL
+    chronological order for rolling windows. Monotonic by construction:
+    local_hour resets to 0 exactly when date increments, unlike gmt_hour
+    (which wraps mid-day for any airport not at UTC+0 - see module
+    docstring). Never exposed in output tables, which keep
+    date/local_hour/gmt_hour as separate columns per schema.md's
+    convention."""
     dates = pd.to_datetime(pd.Series(dates))
-    return dates + pd.to_timedelta(pd.Series(gmt_hours), unit="h")
+    return dates + pd.to_timedelta(pd.Series(local_hours), unit="h")
 
 
 def _rolling_mean_and_delta(
@@ -83,7 +95,7 @@ def build_near_term_operational_features(
     frames = [load_airport_analysis(year, month) for year, month in year_months]
     combined = pd.concat(frames, ignore_index=True)
     combined = combined[combined["airport"] == airport].copy()
-    combined["_ts"] = _airport_hour_index(combined["date"], combined["gmt_hour"])
+    combined["_ts"] = _local_sort_key(combined["date"], combined["local_hour"])
     rolled = _rolling_mean_and_delta(combined, OPERATIONAL_NUMERIC_COLS, window_hours)
     out = combined[["airport", "date", "local_hour", "gmt_hour"]].reset_index(drop=True)
     return pd.concat([out, rolled], axis=1)
@@ -108,7 +120,7 @@ def build_near_term_edct_features(
         raise ValueError(f"no EDCT data available for airport {airport} in months {year_months}")
 
     combined = pd.concat(frames, ignore_index=True).copy()
-    combined["_ts"] = _airport_hour_index(combined["date"], combined["gmt_hour"])
+    combined["_ts"] = _local_sort_key(combined["date"], combined["local_hour"])
     rolled = _rolling_mean_and_delta(combined, EDCT_NUMERIC_COLS, window_hours)
     out = combined[["airport", "date", "local_hour", "gmt_hour"]].reset_index(drop=True)
     return pd.concat([out, rolled], axis=1)
@@ -118,13 +130,17 @@ def build_near_term_weather_features(
     airport: str, window_hours: int = WINDOW_HOURS
 ) -> pd.DataFrame:
     """One row per (date, gmt_hour): METAR observations plus their
-    rolling mean/delta over the trailing `window_hours`. Coerces the
-    numeric columns explicitly first, same fix as features/strategic.py's
+    rolling mean/delta over the trailing `window_hours`. Sorted by
+    `local_hour_approx` (see module docstring), not `gmt_hour` -
+    load_weather() has no exact local_hour, but an approximate one is
+    still far more reliable for chronological ORDERING than gmt_hour,
+    which has a guaranteed daily discontinuity. Coerces the numeric
+    columns explicitly first, same fix as features/strategic.py's
     build_recent_weather_features (IEM's "M" missing-observation sentinel
     - see features/planning_features_validation.md, Issue 1)."""
     wx = load_weather(airport).copy()
     wx[WEATHER_NUMERIC_COLS] = wx[WEATHER_NUMERIC_COLS].apply(pd.to_numeric, errors="coerce")
-    wx["_ts"] = _airport_hour_index(wx["date"], wx["gmt_hour"])
+    wx["_ts"] = _local_sort_key(wx["date"], wx["local_hour_approx"])
     rolled = _rolling_mean_and_delta(wx, WEATHER_NUMERIC_COLS, window_hours)
     out = wx[["airport", "date", "gmt_hour"]].reset_index(drop=True)
     return pd.concat([out, rolled], axis=1)
@@ -152,10 +168,9 @@ def build_lightweight_rotation_signal(
     measure). Known approximation: BTS's FlightDate is the scheduled
     DEPARTURE date, so a flight landing just after local midnight is
     still bucketed under its departure day here rather than its true
-    arrival day - BTS exposes no separate arrival-date field. Same class
-    of approximation as schema.md's own local_hour_approx note for
-    weather - acceptable for a fast, lightweight signal, not a
-    load-bearing exact join."""
+    arrival day - BTS exposes no separate arrival-date field. Already
+    sorts by local_hour - never had the gmt_hour bug the other three
+    builders did, since BTS has no gmt_hour equivalent to begin with."""
     frames = [load_bts(year, month) for year, month in year_months]
     combined = pd.concat(frames, ignore_index=True)
     combined = combined[
@@ -175,7 +190,7 @@ def build_lightweight_rotation_signal(
         .reset_index()
         .rename(columns={"ArrDelay": "inbound_arr_delay"})
     )
-    hourly["_ts"] = hourly["date"] + pd.to_timedelta(hourly["local_hour"], unit="h")
+    hourly["_ts"] = _local_sort_key(hourly["date"], hourly["local_hour"])
     rolled = _rolling_mean_and_delta(hourly, ["inbound_arr_delay"], window_hours)
     out = hourly[["date", "local_hour"]].reset_index(drop=True)
     out.insert(0, "airport", airport)
