@@ -1,55 +1,47 @@
 """
-The capstone integration for the Planning tier: wires together every prior
-step against REAL data. Step 3's features -> Step 7's model -> Step 12's
-ShadowModeLog -> Step 4's real labels (revealed only after prediction) ->
-Step 9's KPI suite. Nothing else in this project runs the full pipeline
-end to end - every earlier validation exercised one piece at a time.
+Shadow-mode replay for the Planning tier: walks real dates in chronological
+order as if live. On each simulated day it records that day's predictions
+in a ShadowModeLog (validation/shadow_mode.py), and resolves an outcome
+only once its label window has fully elapsed (as-of date + horizon_days).
+Nothing a prediction does can reach back into the model or the data.
 
-Still bounded by the same real limitation as every prior step: the model
-is untrained, so predictions are meaningless as forecasts. What this
-proves is that the PLUMBING connects correctly across all six pieces, on
-real downloaded data, not synthetic inputs - the final proof point before
-this tier's Phase 1-3 work "holds short" per the build sequence doc.
+`predict_fn(rows) -> probabilities` wraps any frozen model with its own
+preprocessing (e.g. models.planning.compare_losses.predict_from_checkpoint),
+so the replay uses exactly what was evaluated.
 """
 
-import torch
+import numpy as np
+import pandas as pd
 
-from features.planning import build_planning_features
-from features.planning_label import build_planning_labels
-from models.planning.planning_disruptnet import PlanningDisruptNet
+from features.planning_label import DEFAULT_HORIZON_DAYS
 from validation.shadow_mode import ShadowModeLog
 
-FEATURE_COLUMNS = [
-    "day_of_year_sin", "day_of_year_cos",
-    "climo_tmpf", "climo_sknt", "climo_vsby", "climo_disruption_rate",
-]
 
-
-def run_shadow_mode_replay(
-    model: PlanningDisruptNet,
-    airport: str,
-    dates,
-    edct_months_for_climatology: list,
-    horizon_days: int = 30,
-) -> ShadowModeLog:
-    """Replays shadow-mode operation against real historical data for one
-    airport. Builds real features and real labels, records a prediction
-    per date WITHOUT ever exposing the label to the model, then resolves
-    each outcome only afterward - mirroring the temporal flow a live
-    deployment would follow.
-    """
-    feature_table = build_planning_features(airport, dates, edct_months_for_climatology)
-    label_table = build_planning_labels(airport, dates, horizon_days)
-
+def run_shadow_mode_replay(frame: pd.DataFrame, predict_fn, horizon_days: int = DEFAULT_HORIZON_DAYS):
+    """frame: rows with airport, date, label and the model's features.
+    Returns (log, pending): pending[i] = predictions still unresolved at the
+    end of simulated day i, the live-deployment backlog."""
     log = ShadowModeLog()
+    by_date = {d: g for d, g in frame.groupby("date")}
+    days = sorted(by_date)
 
-    with torch.no_grad():
-        for _, row in feature_table.iterrows():
-            x = torch.tensor([[row[c] for c in FEATURE_COLUMNS]], dtype=torch.float32)
-            pred_prob = model(x).item()
-            log.record_prediction(row["date"], airport, pred_prob)
+    def resolve(d):
+        for _, r in by_date[d].iterrows():
+            log.resolve_outcome(d, r["airport"], bool(r["label"]))
 
-    for _, row in label_table.iterrows():
-        log.resolve_outcome(row["date"], airport, bool(row["label"]))
+    pending, j = [], 0
+    for day in days:
+        rows = by_date[day]
+        for (_, r), p in zip(rows.iterrows(), np.asarray(predict_fn(rows))):
+            log.record_prediction(day, r["airport"], float(p))
+        # Every as-of date whose window has elapsed by today - including ones
+        # whose exact maturity day had no rows (data gaps).
+        while j < len(days) and days[j] <= day - pd.Timedelta(days=horizon_days):
+            resolve(days[j])
+            j += 1
+        pending.append(log.unresolved_count())
 
-    return log
+    # After the last day, let the clock run until every window has elapsed.
+    for d in days[j:]:
+        resolve(d)
+    return log, pending

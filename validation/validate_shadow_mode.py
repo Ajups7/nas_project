@@ -12,15 +12,16 @@ import pandas as pd
 import torch
 
 from losses.faoc_loss import FAOCLoss
-from models.planning.planning_disruptnet import PlanningDisruptNet
+from models.planning.compare_losses import predict_from_checkpoint
+from models.planning.data import load_planning_splits
+from models.planning.train_disruptnet import CHECKPOINT_DIR
 from validation.kpi_suite import calibration_error, cost_weighted_recall, false_alarm_cost
 from validation.shadow_mode import SAFE_PUBLIC_METHODS, ShadowModeLog
 from validation.shadow_mode_replay import run_shadow_mode_replay
 
 AIRPORT = "ATL"
-DATES = pd.date_range("2019-06-20", "2019-06-24")
-EDCT_MONTHS_FOR_CLIMATOLOGY = [(2019, 6), (2019, 7)]
-NUM_FEATURES = 6
+DATES = pd.date_range("2023-06-20", "2023-06-24")
+CHECKPOINT = CHECKPOINT_DIR / "final_standard_seed0.pt"
 
 
 def validate_api_surface():
@@ -58,18 +59,15 @@ def validate_basic_mechanics():
 
 
 def validate_real_replay():
-    print("=== CAPSTONE: full replay against real data ===")
+    print("=== CAPSTONE: replay of the frozen main model against real data ===")
+    val = load_planning_splits(exclude_covid=True)["validation"]
+    frame = val[(val["airport"] == AIRPORT) & val["date"].isin(DATES)]
     print(f"airport={AIRPORT}, dates={[d.date() for d in DATES]}")
-    print("(model is untrained - PlanningDisruptNet from Step 7 - so predictions")
-    print(" are meaningless as forecasts. This proves the PLUMBING connects.)")
-    print()
+    log, pending = run_shadow_mode_replay(frame, lambda rows: predict_from_checkpoint(CHECKPOINT, rows))
 
-    torch.manual_seed(0)
-    model = PlanningDisruptNet(input_dim=NUM_FEATURES)
-    log = run_shadow_mode_replay(model, AIRPORT, DATES, EDCT_MONTHS_FOR_CLIMATOLOGY)
-
-    print(f"dates replayed: {len(DATES)}")
-    print(f"unresolved after replay: {log.unresolved_count()} (expect 0 - every date's outcome is known)")
+    print(f"dates replayed: {len(frame)}; unresolved at end of each simulated day: {pending}")
+    print("(all pending: no 30-day window elapses inside a 5-day replay)")
+    print(f"unresolved after the clock runs out: {log.unresolved_count()} (expect 0)")
 
     resolved = log.resolved_pairs()
     print()

@@ -1,168 +1,152 @@
 """
-Person B (Strategic tier) - Step 2 of the build sequence: day-ahead
-features for the 2-24h forecast horizon (see TEAM_PLAN.md).
+Strategic tier (2-24h): day-ahead features. One row per (airport, D): what
+is known at the END of day D, used to predict whether D+1 is a GDP day
+(features/strategic_label.py).
 
-Four feature groups, each answering "what would you actually know about
-this airport, the day before the forecast day":
+Person B's original design (Step 2) used day D-1's actuals in row D while
+the label is D+1 - a one-day gap that skipped day D's actuals, which are
+complete by the end of D. Revised 2026-10 so row D carries day D. Also
+moved to the shared GDP-day definition (common/disruption.py) and the
+Parquet caches (common/aspm_cache.py).
 
-1. Calendar/seasonal signals - reused directly from
-   features.planning.build_calendar_features rather than reimplemented:
-   it's pure date arithmetic with no tier-specific logic in it (day of
-   week, cyclical day-of-year), so duplicating it here would just be two
-   copies of the same function to keep in sync.
-2. Recent operational conditions - yesterday's actual ASPM Airport
-   Analysis (capacity/demand, delays, taxi times), collapsed from
-   airport-hour to one airport-day row.
-3. Recent disruption activity - yesterday's actual EDCT rate (this
-   project's GDP proxy - see schema.md), same underlying signal as
-   features/planning.py's disruption climatology, but the ACTUAL prior day
-   rather than a historical seasonal average.
-4. Recent weather actuals - yesterday's actual METAR summary, not a
-   forecast (METAR is observed - see schema.md) and not a climatology
-   average either.
+Feature groups:
+1. Target-day calendar: cyclical day-of-year and day-of-week of D+1.
+2. Day-D operations (ASPM Airport Analysis, airport-hour -> daily mean):
+   on-time rates, delays, taxi times.
+3. Schedule: scheduled arrivals/departures for D and D+1. Schedules are
+   published in advance, so D+1's are known at prediction time; demand
+   against capacity is what triggers a GDP.
+4. Day-D disruption: share of arrivals with an EDCT, GDP-day flag, and the
+   GDP-day rate over the past 7 days (through D).
+5. Day-D weather (METAR, observed): daily means plus the extremes that drive
+   GDPs - min visibility, max wind, max gust, share of reports with
+   thunderstorms. METAR dates are UTC; ASPM dates are local - a known
+   misalignment of a few hours.
+6. Climatology: train-period GDP-day rate for D+1's calendar month.
 
-Why yesterday's actuals, not climatology (Planning tier) or a live nowcast
-(Tactical tier): at a 2-24h horizon there's no real weather forecast to
-lean on any more than Planning has, but there IS a much stronger near-term
-signal available than "typical for this time of year" - short-term
-persistence. A Ground Delay Program yesterday raises the odds of continued
-disruption today (backlogged aircraft/crew, cascading rotation delays -
-see losses/delay_propagation_multipliers.csv for the cost side of exactly
-this phenomenon), and weather is itself autocorrelated day-to-day. Using
-today's OWN actuals to predict today would be leakage; using yesterday's
-is the last point that's both informative and genuinely knowable in
-advance at this horizon.
-
-Mechanically: each of groups 2-4 is built keyed by its own observation
-date, then shifted forward by exactly one day before merging, so that the
-row for forecast date D holds date (D-1)'s actual values - this keeps the
-shift logic in one place (build_strategic_features) rather than every
-helper needing to know it's really building "yesterday's" table.
-
-Output tables are keyed by (airport, date), matching features/planning.py's
-convention (see that module's docstring for why local_hour/gmt_hour are
-correctly omitted from a daily-frequency table).
+Build the cached dataset (after `python -m common.aspm_cache airport_analysis`):
+    python -m features.strategic
 """
 
+import numpy as np
 import pandas as pd
 
-from common.data_loader import DATA_DIR, load_airport_analysis, load_edct, load_weather
-from features.planning import build_calendar_features
+from common.aspm_cache import load_airport_analysis_cache
+from common.data_loader import DATA_DIR, load_weather
+from common.disruption import GDP_ARRIVAL_SHARE_THRESHOLD, daily_arrival_edct_share, gdp_days
+from common.temporal_split import TRAIN_END, VALIDATION_END, assign_temporal_split
+from features.planning import eligible_airports
+from features.strategic_label import build_strategic_labels
 
-WEATHER_NUMERIC_COLS = ["tmpf", "dwpf", "drct", "sknt", "gust", "vsby", "alti"]
 OPERATIONAL_NUMERIC_COLS = [
     "pct_ontime_gate_dep", "pct_ontime_airport_dep", "pct_ontime_gate_arr",
     "avg_gate_dep_delay", "avg_taxi_out_time", "avg_taxi_out_delay",
     "avg_airport_dep_delay", "avg_airborne_delay", "avg_taxi_in_delay",
     "avg_block_delay", "avg_gate_arr_delay",
 ]
+WEATHER_NUMERIC_COLS = ["tmpf", "dwpf", "drct", "sknt", "gust", "vsby", "alti"]
+
+CALENDAR_COLUMNS = ["target_doy_sin", "target_doy_cos", "target_dow_sin", "target_dow_cos"]
+OPS_COLUMNS = [f"ops_{c}" for c in OPERATIONAL_NUMERIC_COLS]
+SCHEDULE_COLUMNS = ["sched_arr_today", "sched_dep_today", "sched_arr_tomorrow", "sched_dep_tomorrow"]
+DISRUPTION_COLUMNS = ["arr_edct_share_today", "gdp_day_today", "gdp_rate_7d"]
+WEATHER_COLUMNS = ([f"wx_{c}" for c in WEATHER_NUMERIC_COLS]
+                   + ["wx_min_vsby", "wx_max_sknt", "wx_max_gust", "wx_ts_share"])
+CLIMO_COLUMNS = ["climo_gdp_day_rate_target"]
+FEATURE_COLUMNS = (CALENDAR_COLUMNS + OPS_COLUMNS + SCHEDULE_COLUMNS + DISRUPTION_COLUMNS
+                   + WEATHER_COLUMNS + CLIMO_COLUMNS)
+
+DAILY_PATH = DATA_DIR / "cache" / "strategic_daily_features.parquet"
+LABELS_PATH = DATA_DIR / "cache" / "strategic_labels.parquet"
 
 
-def build_recent_operational_features(
-    airport: str, year_months: list[tuple[int, int]]
-) -> pd.DataFrame:
-    """One row per date, ASPM Airport Analysis's airport-hour rows
-    collapsed to a daily mean, for `airport` across the given
-    (year, month) list. Columns prefixed `recent_` - these describe the
-    OWN observation date, not yet shifted forward; that shift happens in
-    build_strategic_features, not here, so this function stays reusable
-    for anyone who wants same-day (not day-ahead) operational aggregates."""
-    frames = [load_airport_analysis(year, month) for year, month in year_months]
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined[combined["airport"] == airport]
-    daily = combined.groupby("date")[OPERATIONAL_NUMERIC_COLS].mean().reset_index()
-    daily.columns = ["date"] + [f"recent_{c}" for c in OPERATIONAL_NUMERIC_COLS]
-    daily.insert(0, "airport", airport)
-    return daily
+def _daily_operations() -> pd.DataFrame:
+    aa = load_airport_analysis_cache(["airport", "date", "scheduled_arrivals", "scheduled_departures"]
+                                     + OPERATIONAL_NUMERIC_COLS)
+    for c in OPERATIONAL_NUMERIC_COLS + ["scheduled_arrivals", "scheduled_departures"]:
+        aa[c] = pd.to_numeric(aa[c], errors="coerce")
+    g = aa.groupby(["airport", "date"])
+    out = g[OPERATIONAL_NUMERIC_COLS].mean()
+    out.columns = OPS_COLUMNS
+    out["sched_arr"] = g["scheduled_arrivals"].sum()
+    out["sched_dep"] = g["scheduled_departures"].sum()
+    return out.reset_index()
 
 
-def build_recent_disruption_features(
-    airport: str, year_months: list[tuple[int, int]]
-) -> pd.DataFrame:
-    """One row per date: `recent_disruption_rate`, the mean of
-    pct_arrivals_with_edct and pct_departures_with_edct across that date's
-    airport-hours - the same quantity as features/planning.py's
-    disruption climatology, but per-date rather than averaged across years
-    into a per-month climatology.
-
-    Missing EDCT months (README.md, "2 known gaps") are skipped with a
-    warning via a direct file-existence check, not a try/except around
-    load_edct() - same reasoning as features/planning.py and
-    features/planning_label.py's identical check: a missing .xls makes
-    pandas.read_html fail with a generic "No tables found" ValueError that
-    looks like a parsing bug, not a missing-file one.
-    """
-    frames = []
-    for year, month in year_months:
-        path = DATA_DIR / "aspm_edct_report" / f"{year}_{month:02d}.xls"
-        if not path.exists():
-            print(f"build_recent_disruption_features: no EDCT file for {year}-{month:02d}, skipping (known gap)")
-            continue
-        edct = load_edct(year, month)
-        frames.append(edct[edct["airport"] == airport])
-
-    if not frames:
-        raise ValueError(f"no EDCT data available for airport {airport} in months {year_months}")
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined["disruption_rate"] = combined[
-        ["pct_arrivals_with_edct", "pct_departures_with_edct"]
-    ].mean(axis=1)
-    daily = combined.groupby("date")["disruption_rate"].mean().reset_index()
-    daily.columns = ["date", "recent_disruption_rate"]
-    daily.insert(0, "airport", airport)
-    return daily
-
-
-def build_recent_weather_features(airport: str, dates: pd.Series) -> pd.DataFrame:
-    """One row per date in `dates`, METAR observations collapsed to a
-    daily mean, for `airport`. Coerces the numeric columns explicitly
-    before aggregating - load_weather() returns them as object dtype
-    because of IEM's "M" missing-observation sentinel (confirmed on real
-    data - see features/planning_features_validation.md, Issue 1 - the
-    same data_loader.py-level gap, worked around here the same way
-    features/planning.py's build_weather_climatology() does it)."""
-    dates = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
-    date_range = (dates.min(), dates.max())
-
-    wx = load_weather(airport).copy()
-    wx = wx[(wx["date"] >= date_range[0]) & (wx["date"] <= date_range[1])]
-    wx[WEATHER_NUMERIC_COLS] = wx[WEATHER_NUMERIC_COLS].apply(pd.to_numeric, errors="coerce")
-    daily = wx.groupby("date")[WEATHER_NUMERIC_COLS].mean().reset_index()
-    daily.columns = ["date"] + [f"recent_{c}" for c in WEATHER_NUMERIC_COLS]
-    daily.insert(0, "airport", airport)
-    return daily
-
-
-def build_strategic_features(
-    airport: str,
-    dates: pd.Series,
-    year_months: list[tuple[int, int]],
-) -> pd.DataFrame:
-    """Assembles all four feature groups into one table keyed by
-    (airport, date): calendar features for date D itself, plus
-    operational/disruption/weather actuals from date (D-1), shifted
-    forward by one day so they join directly on D.
-
-    `year_months` must cover every month touched by (min(dates) - 1) ..
-    max(dates), inclusive, so the day-before lookup for the earliest
-    requested date has data to find - the caller decides this window (see
-    features/planning.py's build_disruption_climatology for the same
-    caller-decides-the-window convention)."""
-    dates = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
-
-    calendar = build_calendar_features(dates)
-    calendar.insert(0, "airport", airport)
-
-    one_day = pd.Timedelta(days=1)
-    operational = build_recent_operational_features(airport, year_months)
-    operational["date"] = operational["date"] + one_day
-    disruption = build_recent_disruption_features(airport, year_months)
-    disruption["date"] = disruption["date"] + one_day
-    weather = build_recent_weather_features(airport, dates - one_day)
-    weather["date"] = weather["date"] + one_day
-
-    out = calendar.merge(operational, on=["airport", "date"], how="left")
-    out = out.merge(disruption, on=["airport", "date"], how="left")
-    out = out.merge(weather, on=["airport", "date"], how="left")
+def _daily_weather(airport: str) -> pd.DataFrame:
+    wx = load_weather(airport)
+    num = wx[WEATHER_NUMERIC_COLS].apply(pd.to_numeric, errors="coerce")
+    num["date"] = wx["date"].to_numpy()
+    num["ts"] = wx["wxcodes"].astype(str).str.contains("TS", na=False).astype(float)
+    g = num.groupby("date")
+    out = g[WEATHER_NUMERIC_COLS].mean()
+    out.columns = [f"wx_{c}" for c in WEATHER_NUMERIC_COLS]
+    out["wx_min_vsby"] = g["vsby"].min()
+    out["wx_max_sknt"] = g["sknt"].max()
+    out["wx_max_gust"] = g["gust"].max()
+    out["wx_ts_share"] = g["ts"].mean()
     return out
+
+
+def build_strategic_features(airport: str, calendar: pd.DatetimeIndex, ops: pd.DataFrame,
+                             threshold: float = GDP_ARRIVAL_SHARE_THRESHOLD,
+                             train_end: str = TRAIN_END) -> pd.DataFrame:
+    """Feature rows for every date in `calendar` (row D = known at end of D)."""
+    target = calendar + pd.Timedelta(days=1)
+    out = pd.DataFrame({"airport": airport, "date": calendar})
+    doy = target.dayofyear.to_numpy()
+    days_in_year = np.where(target.is_leap_year, 366, 365)
+    out["target_doy_sin"] = np.sin(2 * np.pi * doy / days_in_year)
+    out["target_doy_cos"] = np.cos(2 * np.pi * doy / days_in_year)
+    out["target_dow_sin"] = np.sin(2 * np.pi * target.dayofweek.to_numpy() / 7)
+    out["target_dow_cos"] = np.cos(2 * np.pi * target.dayofweek.to_numpy() / 7)
+
+    o = ops[ops["airport"] == airport].set_index("date").reindex(calendar)
+    for c in OPS_COLUMNS:
+        out[c] = o[c].to_numpy()
+    out["sched_arr_today"] = o["sched_arr"].to_numpy()
+    out["sched_dep_today"] = o["sched_dep"].to_numpy()
+    out["sched_arr_tomorrow"] = o["sched_arr"].shift(-1).to_numpy()
+    out["sched_dep_tomorrow"] = o["sched_dep"].shift(-1).to_numpy()
+
+    share = daily_arrival_edct_share()[airport].reindex(calendar)
+    gdp = gdp_days(threshold)[airport].reindex(calendar)
+    out["arr_edct_share_today"] = share.to_numpy()
+    out["gdp_day_today"] = gdp.to_numpy()
+    out["gdp_rate_7d"] = gdp.rolling(7, min_periods=1).mean().to_numpy()
+
+    wx = _daily_weather(airport).reindex(calendar)
+    for c in WEATHER_COLUMNS:
+        out[c] = wx[c].to_numpy()
+
+    train = gdp.loc[:train_end]
+    month_rate = train.groupby(train.index.month).mean()
+    out["climo_gdp_day_rate_target"] = target.month.map(month_rate).to_numpy()
+    return out
+
+
+def build_strategic_dataset(airports: list[str], threshold: float = GDP_ARRIVAL_SHARE_THRESHOLD):
+    """Returns (daily, labels): features for every airport x calendar day
+    (sequence/graph models need complete history windows), and the
+    labelable rows (airport, date, label, split)."""
+    calendar = gdp_days(threshold).index
+    ops = _daily_operations()
+    daily, labels = [], []
+    for airport in airports:
+        daily.append(build_strategic_features(airport, calendar, ops, threshold))
+        labels.append(build_strategic_labels(airport, calendar.to_series().reset_index(drop=True), threshold))
+    labels = pd.concat(labels, ignore_index=True)
+    labels["split"] = assign_temporal_split(labels["date"], TRAIN_END, VALIDATION_END).values
+    return pd.concat(daily, ignore_index=True), labels
+
+
+if __name__ == "__main__":
+    import time
+
+    t = time.time()
+    airports = eligible_airports()
+    daily, labels = build_strategic_dataset(airports)
+    daily.to_parquet(DAILY_PATH, index=False)
+    labels.to_parquet(LABELS_PATH, index=False)
+    print(f"{len(airports)} airports: {len(daily):,} daily feature rows, {len(labels):,} labeled rows "
+          f"in {time.time() - t:.0f}s")

@@ -7,12 +7,11 @@ EDCT activity occurred at that airport in any hour in the window
 (ts, ts + horizon_hours] - "will a disruption occur sometime in the next
 0-2h" - else 0.
 
-Uses the EXACT SAME "had_edct" criterion as Person C's
-features/planning_label.py: arrivals_with_edct > 0 OR
-departures_with_edct > 0. Deliberately reusing that same criterion, not
-inventing a different one, so "disruption" means the same thing across
-all three tiers - only the look-ahead WINDOW differs (hours here vs. days
-for Strategic/Planning).
+OUT OF SYNC (2026-10): Planning and Strategic moved to the shared GDP-day
+definition in common/disruption.py (>= 10% of arrivals with an EDCT,
+arrivals only - see features/planning_label_validation.md). This module
+still uses the old criterion, arrivals_with_edct > 0 OR
+departures_with_edct > 0, pending an hourly equivalent of that definition.
 
 NOT a thin wrapper over build_planning_labels the way
 features/strategic_label.py is: that function's internals assume

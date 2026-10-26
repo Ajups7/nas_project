@@ -50,10 +50,13 @@ class ShadowModeLog:
 
     def __init__(self):
         self._predictions: list[ShadowPrediction] = []
+        self._keys: set[tuple] = set()
         self._outcomes: dict[tuple, bool] = {}
 
     def record_prediction(self, date, airport: str, predicted_probability: float) -> None:
-        self._predictions.append(ShadowPrediction(pd.Timestamp(date), airport, predicted_probability))
+        p = ShadowPrediction(pd.Timestamp(date), airport, predicted_probability)
+        self._predictions.append(p)
+        self._keys.add((p.date, p.airport))
 
     def resolve_outcome(self, date, airport: str, outcome: bool) -> None:
         """Fills in the real outcome once it's knowable (i.e. once the
@@ -61,7 +64,7 @@ class ShadowModeLog:
         actually elapsed). Raises if there's no matching recorded
         prediction, rather than silently creating one out of thin air."""
         key = (pd.Timestamp(date), airport)
-        if key not in {(p.date, p.airport) for p in self._predictions}:
+        if key not in self._keys:
             raise ValueError(f"no recorded prediction for ({airport}, {pd.Timestamp(date).date()})")
         self._outcomes[key] = outcome
 

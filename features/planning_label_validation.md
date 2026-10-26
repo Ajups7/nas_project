@@ -1,125 +1,187 @@
 # Planning label: validation results and explanation
 
-Same philosophy as `planning_features_validation.md`: this runs against
-**real** downloaded EDCT data, not synthetic inputs, because real data
-exists to check it against.
+Runs against **real** EDCT data, not synthetic inputs.
 
-## What the label actually is
+## What the label is
 
-For a given `(airport, date)`: **1 if EDCT activity occurred at that
-airport on any day in `(date+1, date+30]`, else 0.** In plain terms — "will
-this airport need a Ground Delay Program at some point in the next 1 to 30
-days?"
+For a given `(airport, date)`: **1 if a GDP day occurs at that airport on
+any day in `(date+1, date+30]`, else 0.**
 
-**Why "any EDCT activity" instead of a percentage threshold**: an EDCT
-(Expect Departure Clearance Time) only gets assigned when the FAA is
-actively running a Ground Delay Program — see `schema.md`, "GDP proxy label
-source." Its mere presence at an airport-hour already means a GDP was in
-effect. Unlike FAOC-Loss's `avg_fn_hours`/`avg_fp_hours` (`losses/
-cost_figures.md` §4), which had no natural threshold and had to be a
-documented guess, this label needed no invented cutoff — presence/absence
-of EDCT activity is the real signal, not an approximation of one.
+A **GDP day** (`common/disruption.py`, shared by all three tiers) is a day
+on which **at least 10% of the airport's arrivals had an EDCT**.
 
-**Known limitation, stated up front**: EDCT only proxies Ground Delay
-Programs — it says nothing about Ground Stops or Miles-in-Trail
-restrictions (`schema.md`). So this label is a **lower bound** on "any
-disruption occurred," not the true GDP/GS/MIT label `PLAN.md` ultimately
-wants. That requires ASPM Advisories access, still blocked on FAA account
-approval (`README.md`).
+Unknown days (missing EDCT month, or no arrivals reported) are handled
+conservatively: a window containing a known GDP day is still `1`, but a
+window with no GDP day *and* an unknown day can't be called `0`, so that row
+is dropped. Windows running past the end of the data (2026-01-31) are
+dropped too.
 
-## How to reproduce this
+**Known limitation**: EDCT proxies Ground Delay Programs only — no Ground
+Stop or Miles-in-Trail signal. Real GDP/GS/MIT labels need ASPM Advisories
+access (`README.md`).
+
+## Label redesign (2026-10)
+
+### The original definition was nearly constant
+
+Until 2026-10 the label was "any EDCT activity, arrival **or** departure, in
+the next 30 days." Measured on the train period (2016-01 – 2022-12):
+
+| | Original label |
+|---|---|
+| Overall prevalence | 90% |
+| Median airport prevalence | 98% |
+| Airports ≥ 95% positive | 65 of 82 |
+| Airports ≤ 5% positive | 5 of 82 (no arrival data at all — see below) |
+
+A model could score ~90% by memorizing which airports are busy, without
+learning anything about timing.
+
+### Why arrivals only
+
+A GDP holds flights bound **for** a constrained airport at their origins.
+So at airport X:
+
+- **Arrivals with EDCT** are flights into X that were held — mostly a GDP
+  **at X**.
+- **Departures with EDCT** are flights leaving X held for a GDP at their
+  **destination** — a disruption somewhere else.
+
+Counting departures is why hubs read as "disrupted" almost daily: ATL
+serves dozens of destinations, and one of them nearly always has a GDP.
+
+Caveat: arrival EDCTs also come from Airspace Flow Programs (en-route
+weather), not only the airport's own GDP. The threshold below filters most
+of those isolated EDCTs out.
+
+### Why 10%
+
+There is **no published source** for this number. It is supported by two
+checks on the train-period distribution of the daily share of arrivals with
+an EDCT (193,546 airport-days):
+
+**1. The distribution has a trough near 10% and a second hump at 20–50%.**
+
+| Daily arrival-EDCT share | Airport-days | % |
+|---|---|---|
+| exactly 0 | 175,216 | 90.5 |
+| 0.1–1% | 4,016 | 2.07 |
+| 1–2% | 1,913 | 0.99 |
+| 2–3% | 1,204 | 0.62 |
+| 3–5% | 1,535 | 0.79 |
+| 5–7.5% | 984 | 0.51 |
+| **7.5–10%** | **570** | **0.29** |
+| 10–15% | 867 | 0.45 |
+| 15–20% | 1,056 | 0.55 |
+| 20–30% | 1,945 | 1.00 |
+| 30–50% | 2,811 | 1.45 |
+| 50–100% | 1,429 | 0.74 |
+
+Below 10%, counts fall off steadily — scattered, one-off EDCTs. Above it,
+they rise into a second population: program days. The trough is shallow
+(normalized for bin width it sits in roughly 10–15%), so this supports
+"about 10%," not 10% exactly.
+
+**2. Above 10%, days look like a sustained program.** Median hours per day
+in which at least half of arrivals were held:
+
+| Daily share | Median hours ≥ 50% held |
+|---|---|
+| < 10% | 0 |
+| 10–20% | 2 |
+| ≥ 20% | 8 |
+
+### Effect of the threshold
+
+| Threshold | Median airport GDP-day rate | Median airport 30-day label prevalence | Airports ≥ 95% positive |
+|---|---|---|---|
+| 5% | 2.5% | 28% | 1 of 82 |
+| **10%** | **1.1%** | **14.5%** | **0 of 82** |
+| 20% | 0.5% | 8% | 0 |
+| 30% | 0.3% | 3% | 0 |
+
+Caution on the "median airport" column: it is over all 82 airports,
+counting the 5 no-data airports as 0, and per-airport prevalence is bimodal
+(many near 0, many well above), so the median jumps with small changes in
+which airports are included. On the final 75-airport training set
+(`features/planning.py`'s `eligible_airports()`), 10% gives: pooled train
+prevalence **32%**, per-airport quartiles **4% / 26% / 60%**, 24 airports
+≤ 5%, none ≥ 95%. Prefer those numbers.
+
+Highest GDP-day rates at 10%: EWR 38%, SFO 29%, LGA 25%, JFK 17%, BOS 16% —
+the airports known for chronic GDPs, which is a sanity check that the
+definition captures real programs.
+
+**5% and 20% are evaluated as a sensitivity check** (the `threshold`
+argument of `build_planning_labels`), so no conclusion rests on 10% alone.
+If ASPM Advisories access arrives, calibrate the threshold against real GDP
+issuances.
+
+### Excluded airports (75 of 82 kept)
+
+Airports need a known GDP-day value on ≥ 90% of train days
+(`eligible_airports()` in `features/planning.py`):
+
+- **APA, ASE, BJC, BOI, CMH** appear in the ASPM EDCT report only from
+  mid-2023 — no train-period data at all.
+- **OXR** (78% of train days known) and **GYY** (85%): dropping
+  unconfirmable 0s biases their labels — OXR keeps only 4% of its train
+  rows, 95% of them positive.
+
+Every other airport keeps 96–98% of its train rows (the loss is the
+2016-07 missing month).
+
+## How to reproduce
 
 ```bash
 cd nas_project
+python -m common.aspm_cache edct          # one-time, ~15 min: Parquet cache of all EDCT months
 python -m features.validate_planning_label
 ```
 
-Uses ATL and 4 dates deliberately chosen to straddle a month boundary (late
-June into early July 2019), so the 30-day forward window has to pull EDCT
-from 3 different calendar months — this exercises the multi-month loading
-path, not just the easy single-month case.
-
 ## Results
 
-### 1. Labels for ATL, and an independent cross-check
+The independent check recomputes each label from the raw `.xls` files with
+a plain per-day loop — a different path from both the Parquet cache and the
+rolling-window implementation.
 
 ```
-airport       date  label
-    ATL 2019-06-20      1
-    ATL 2019-06-25      1
-    ATL 2019-06-30      1
-    ATL 2019-07-05      1
+=== 1. Cross-check against raw .xls (2019-06 .. 2019-08) ===
+  EWR 2019-06-20..07-05: label=1 independent=1 [OK] x4
+  ATL 2019-06-20..07-05: label=1 independent=1 [OK] x4
+  ABQ 2019-06-20..07-05: label=0 independent=0 [OK] x4
+mismatches: 0
+
+=== 2. Label takes both values (all 2019 dates) ===
+  EWR: prevalence 1.000 over 365 dates
+  ATL: prevalence 0.548 over 365 dates
+  ABQ: prevalence 0.000 over 365 dates
+
+=== 3. Missing month 2016-07: a 0 can't be confirmed, a 1 still can ===
+  EWR: kept 2/2 -> both label 1
+  ABQ: kept 0/2 -> []
+
+=== 4. Window past end of data (2026-01-31) is dropped ===
+  EWR horizon 30: kept 1/2 (expect 1)
+
+=== 5. Strategic wrapper (horizon 1) still works ===
+  EWR 2019 next-day GDP prevalence: 0.581 over 365 dates
+
+=== 6. ASE (in ASPM only from mid-2023): 2019 dates are all unknown, so dropped ===
+  ASE 2019 rows kept: 0 (expect 0)
+  ASE 2024 rows kept: 31 (expect >0)
+
+=== 7. Airport absent from EDCT entirely raises ===
+  ValueError: no arrival EDCT data for airport ZZZ
 ```
 
-All four came back `1`. On its own that's not very informative — it could
-mean the label works correctly (ATL genuinely almost always has a GDP
-somewhere in a 30-day window — plausible for one of the busiest hubs in the
-country) or it could mean the function is broken and always returns `1`
-regardless of input. To tell those apart, every one of these four labels
-was recomputed a **second, independent way** — different code, loading the
-months directly and filtering with one boolean mask instead of the real
-function's groupby/reindex approach:
-
-```
-2019-06-20: build_planning_labels=1  independent_check=1  [OK]
-2019-06-25: build_planning_labels=1  independent_check=1  [OK]
-2019-06-30: build_planning_labels=1  independent_check=1  [OK]
-2019-07-05: build_planning_labels=1  independent_check=1  [OK]
-```
-
-Both methods agree on all four dates. That rules out a class of bug where
-the real function's logic and a naive re-implementation would disagree —
-but it still doesn't rule out both being wrong in the *same* way, which is
-exactly what the next check is for.
-
-### 2. Proof the label can actually say "no" — not just always "yes"
-
-```
-=== Edge case: horizon_days=1 (shortest real window) at ATL ===
-airport       date  label
-    ATL 2019-06-20      1
-
-=== Does the label ever actually return 0? Same dates, quiet airport (ADK) ===
-airport       date  label
-    ADK 2019-06-20      0
-    ADK 2019-06-25      0
-    ADK 2019-06-30      0
-    ADK 2019-07-05      0
-```
-
-Shrinking the window to just 1 day still gave ATL a `1` — a real Ground
-Delay Program happened there the very next day, each time. Running the
-exact same dates and window at **ADK** (Adak, a tiny airport in Alaska —
-also the *lowest* delay-propagation-multiplier airport in `losses/
-delay_propagation_multipliers.csv`, at 1.19) came back `0` every time.
-
-This is the check that actually matters: **the label genuinely
-discriminates based on real airport activity, rather than mechanically
-returning the same value no matter what's fed in.** A busy hub and a
-near-empty regional airport, same code, same dates — opposite results,
-and the direction of that difference matches basic real-world intuition
-about which of the two airports is more likely to need a Ground Delay
-Program at all.
-
-## Performance
-
-Computing labels for 4 dates spanning 3 calendar months (2019-06, 2019-07,
-2019-08) took **40.0 seconds** — consistent with `planning_features_validation.md`'s
-measured ~13 seconds/month for `load_edct()`. This confirms
-`build_planning_labels()`'s batching design works as intended: it identified
-all 3 months needed *once*, up front, rather than reloading overlapping
-months once per date (which, for 4 dates each needing up to 2 months, could
-have meant up to 8 loads instead of 3).
+Full output: `logs/validate_planning_label.log`.
 
 ## What this validation does *not* cover
 
-- Only one pair of airports (ATL, ADK) was checked — both at the extreme
-  ends of "busy" and "quiet." A mid-traffic airport wasn't tested, so
-  there's no direct evidence yet of sensible behavior in between.
-- This confirms the label is computed correctly from real EDCT data — it
-  says nothing about whether "any EDCT activity in 30 days" turns out to be
-  a *useful* target for the model to predict. That's a Phase 2/3 question,
-  same caveat as every prior validation in this project.
-- The known EDCT-only limitation (no Ground Stop/MIT signal) means this
-  label likely *undercounts* true disruptions — it can only get more
-  accurate once ASPM Advisories access comes through.
+- Individual airports remain extreme (EWR 100%, ABQ 0% in 2019); the
+  learnable signal is in mid-range airports and seasonal swings. Evaluate
+  per airport, not just pooled, so a good pooled score can't come from
+  airport identity alone.
+- Whether the label is *useful* to predict is a training-time question.
+- No ground-truth GDP records were used; see "Why 10%."

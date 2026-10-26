@@ -105,6 +105,7 @@ def fgsm_perturb(
     airports: list,
     epsilon: float,
     loss_type: str = "faoc",
+    feature_mask: torch.Tensor | None = None,
 ) -> dict:
     """Fast-Gradient-Sign-style perturbation: nudges `x` by `epsilon` in
     the direction that INCREASES the loss most, per input dimension, and
@@ -116,7 +117,8 @@ def fgsm_perturb(
     loss = model.compute_loss(x, labels, airports, loss_type=loss_type)
     loss.backward()
 
-    x_perturbed = (x + epsilon * x.grad.sign()).detach()
+    step = x.grad.sign() if feature_mask is None else x.grad.sign() * feature_mask  # mask: 1 = may perturb
+    x_perturbed = (x + epsilon * step).detach()
     with torch.no_grad():
         pred_before = model(x)
         pred_after = model(x_perturbed)

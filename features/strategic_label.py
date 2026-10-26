@@ -2,9 +2,9 @@
 Person B (Strategic tier) - Step 3 of the build sequence: define the
 strategic label, 2-24h horizon (see TEAM_PLAN.md).
 
-Label definition: for a given (airport, date), label = 1 if EDCT activity
-occurred at that airport on date+1 (the next calendar day), else 0 -
-"will a disruption occur sometime in the next day," matching this tier's
+Label definition: for a given (airport, date), label = 1 if date+1 is a
+GDP day at that airport (common/disruption.py: >= 10% of arrivals had an
+EDCT), else 0 - "will a disruption occur sometime in the next day," matching this tier's
 own "day-ahead" framing the same way features/strategic.py (Step 2) uses
 yesterday's actuals to predict tomorrow.
 
@@ -37,14 +37,16 @@ ultimately wants.
 
 import pandas as pd
 
+from common.disruption import GDP_ARRIVAL_SHARE_THRESHOLD
 from features.planning_label import build_planning_labels
 
 DEFAULT_HORIZON_DAYS = 1
 
 
-def build_strategic_labels(airport: str, dates: pd.Series) -> pd.DataFrame:
-    """For each date in `dates`, label = 1 if EDCT activity occurred at
-    `airport` on date+1 (the very next calendar day), else 0. Thin wrapper
+def build_strategic_labels(airport: str, dates: pd.Series,
+                           threshold: float = GDP_ARRIVAL_SHARE_THRESHOLD) -> pd.DataFrame:
+    """For each date in `dates`, label = 1 if date+1 is a GDP day at
+    `airport`, else 0; dates whose next day is unknown are dropped. Thin wrapper
     over features.planning_label.build_planning_labels with
     horizon_days=1 fixed - see module docstring for why that's exactly
     this tier's label rather than an arbitrary reuse.
@@ -52,4 +54,4 @@ def build_strategic_labels(airport: str, dates: pd.Series) -> pd.DataFrame:
     Returns a table keyed by (airport, date) - joins directly with
     features/strategic.py's build_strategic_features() output on those
     same keys."""
-    return build_planning_labels(airport, dates, horizon_days=DEFAULT_HORIZON_DAYS)
+    return build_planning_labels(airport, dates, horizon_days=DEFAULT_HORIZON_DAYS, threshold=threshold)

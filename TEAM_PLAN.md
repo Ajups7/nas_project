@@ -19,12 +19,12 @@ else below can proceed independently once this is settled.
 Suggested join keys: `(airport, date, local_hour, gmt_hour)` — matches the
 grouping already used across all four downloaded datasets.
 
-## Temporal split — PROPOSED, needs Person A + Person B sign-off
+## Temporal split — AGREED (locked shared infrastructure)
 
 The second shared Phase 0 decision: fixed train/validation/test date
 boundaries, used identically by all three tiers (so results are comparable
-across tiers later, in the Phase 4 validation framework). **Not yet
-agreed** — the below is Person C's concrete proposal, implemented as a
+across tiers later, in the Phase 4 validation framework). **Agreed by all
+three tiers** — Person C's proposal, implemented as a
 reusable function so it can be checked mechanically rather than agreed on
 by eyeballing a calendar: [`common/temporal_split.py`](common/temporal_split.py)'s
 `assign_temporal_split()`, validated in
@@ -49,7 +49,7 @@ required 30). `assign_temporal_split()` computes the exact day-based gap
 instead of rounding to calendar months, so this class of mistake can't
 happen again.
 
-**Concrete proposed boundaries** (`assign_temporal_split(dates, train_end="2022-12-31", validation_end="2024-01-30", embargo_days=30)`):
+**Agreed boundaries** (`assign_temporal_split(dates, train_end="2022-12-31", validation_end="2024-01-30", embargo_days=30)`):
 
 | Bucket | Range | Days |
 |---|---|---|
@@ -67,9 +67,34 @@ Known data gaps (2016-07 and 2025-09 EDCT — see README.md) fall inside
 train and test respectively; neither lands on a boundary, so they don't
 interact with the embargo logic.
 
-**Next step**: Person A and Person B review the function + boundaries above
-and confirm, adjust `train_end`/`validation_end`, or raise concerns — once
-agreed, this becomes locked shared infrastructure like `common/data_loader.py`.
+**Sign-off**: adopted unchanged by both other tiers —
+Tactical (Person A) in [`features/tactical_split.py`](features/tactical_split.py)
+(commit `6b83db8`), Strategic (Person B) in
+[`models/strategic/baselines.py`](models/strategic/baselines.py). This is now
+locked shared infrastructure like `common/data_loader.py` — changes need a
+heads-up to the other two before merging.
+
+## Disruption definition — CHANGED 2026-10 (shared)
+
+All three tiers' labels originally counted **any** EDCT (arrival or
+departure) as a disruption. Measured on the train period, that made the
+Planning label 90% positive (65 of 82 airports ≥ 95%), because departure
+EDCTs at an airport reflect GDPs at its *destinations*.
+
+New shared definition, [`common/disruption.py`](common/disruption.py): a
+**GDP day** is a day on which **≥ 10% of the airport's arrivals had an
+EDCT**. Evidence and threshold reasoning:
+[`features/planning_label_validation.md`](features/planning_label_validation.md).
+
+- **Planning**: migrated (GDP day in the next 1-30 days).
+- **Strategic**: migrated automatically via its wrapper over
+  `build_planning_labels` (GDP day tomorrow). Results in
+  `models/strategic/*_validation.md` were measured under the old label.
+- **Tactical**: not yet migrated — needs an hourly equivalent.
+
+All EDCT reads should go through the Parquet cache
+([`common/aspm_cache.py`](common/aspm_cache.py), build once with
+`python -m common.aspm_cache edct`) instead of `load_edct()` (~15 s/month).
 
 ## Person A — Tactical tier (0-2h) + Baseline Models
 

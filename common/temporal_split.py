@@ -1,14 +1,10 @@
 """
-PROPOSED Phase 0 shared utility - NOT yet agreed on with the team.
+AGREED Phase 0 shared utility - locked; adopted by all three tiers (see
+TEAM_PLAN.md's temporal split section).
 
-Phase 0 (see TEAM_PLAN.md, "Before splitting off") calls for a temporal
-split - fixed train/validation/test date boundaries, used identically by
-all three tiers - decided together, in one sitting. This file is a
-concrete proposal for that split, written as a reusable function so the
-embargo logic can be checked mechanically rather than eyeballed off a
-calendar. Nothing here is final until Person A and Person B have signed
-off - see TEAM_PLAN.md's temporal split section for the human-readable
-version of this same proposal.
+Fixed train/validation/test date boundaries, used identically by all three
+tiers, written as a reusable function so the embargo logic can be checked
+mechanically rather than eyeballed off a calendar.
 
 Why an embargo, not just three adjacent date ranges: the Planning tier's
 label (features/planning_label.py) looks forward up to 30 days from any
@@ -32,6 +28,8 @@ import pandas as pd
 DEFAULT_EMBARGO_DAYS = 30  # matches the Planning tier's own 1-30 day horizon,
                             # the longest of the three tiers and therefore the
                             # binding constraint for everyone's embargo width
+TRAIN_END = "2022-12-31"
+VALIDATION_END = "2024-01-30"
 
 
 def assign_temporal_split(

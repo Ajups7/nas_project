@@ -1,227 +1,245 @@
 """
-Person A (Tactical tier) - Steps 1 and 3 of the build sequence: near-term
-features and a lightweight rotation signal for the 0-2h forecast horizon
-(see TEAM_PLAN.md).
+Tactical tier (0-2 h): hourly features and labels as dense (airport, hour)
+arrays on a shared UTC axis, so index t is the same moment at every
+airport - which the graph model needs to test simultaneous propagation.
 
-Unlike Strategic/Planning's once-a-day feature rows, Tactical operates at
-(airport, date, local_hour, gmt_hour) granularity - a 0-2h horizon needs
-to know what's true RIGHT NOW, not yesterday's actuals or a seasonal
-average.
+Row (airport, t) = what is known at the end of UTC hour t. Label: a GDP hour
+(common/disruption.py: >= 50% of the hour's arrivals with an EDCT, >= 2
+held) occurs at t+1 or t+2. Only hours with scheduled arrivals in t+1..t+2
+are scored (no arrivals, no GDP possible). The onset subset - hours not
+already in a GDP (gdp_hour(t) == 0) - is the operationally important case
+(the 90-minute CDM window) and is reported separately.
 
-Each near-term source (ASPM Airport Analysis, EDCT, METAR) contributes
-both a rolling MEAN over the trailing WINDOW_HOURS and a rolling DELTA
-(this window's mean minus the preceding window's mean) - the delta is
-what actually signals "getting worse right now" versus "has been like
-this all day," which a plain rolling mean can't distinguish.
+Rewritten 2026-10 from Person A's per-airport, per-month pandas version
+(local-hour sort keys, load_edct()/load_airport_analysis() per month).
+Changes: shared GDP-hour definition instead of "any EDCT"; Parquet caches;
+UTC axis; Person A's "lightweight rotation signal" (mean arrival delay of
+flights landing each hour, from 28 GB of BTS) is replaced by the same
+quantity from ASPM Airport Analysis (avg_gate_arr_delay /
+avg_airborne_delay per airport-hour); Person A's 3-hour rolling mean/delta
+design is kept.
 
-Weather is joined on `gmt_hour` for MERGING with operational/EDCT rows
-(exact cross-source key match, unaffected by ordering).
+Features (FEATURE_NAMES):
+- calendar: local hour-of-day, day-of-week, day-of-year (cyclical)
+- schedule: scheduled arrivals/departures at t, t+1, t+2 (published ahead)
+- operations at t: arrivals, on-time arrivals, gate/airborne arrival
+  delay, taxi-out delay, gate/airport departure delay; 3-h mean and delta
+  of arrival, airborne and taxi-out delay
+- EDCT state at t: arrival and departure EDCT share (departure EDCTs = GDPs
+  at destinations), mean EDCT delay, GDP-hour flag, GDP hours in the last
+  3 h and 24 h, 3-h delta of arrival EDCT share
+- weather (METAR, UTC hour): visibility, wind, gust, ceiling, thunderstorm,
+  temperature-dewpoint spread, altimeter; 3-h deltas of visibility,
+  ceiling, altimeter
+- climatology: train-period GDP-hour rate for the airport, month and local hour
 
-IMPORTANT - rolling-window sort key uses LOCAL hour, not gmt_hour: an
-earlier version built its chronological sort key as
-`date + timedelta(hours=gmt_hour)`, which is only valid for an airport at
-UTC+0. For any real airport (e.g. ATL, UTC-4/-5), gmt_hour wraps past
-midnight partway through the LOCAL day - `date` stays the same while
-gmt_hour resets to 0 - creating a large backward jump in the middle of
-every single day and corrupting every rolling window's ordering. Fixed by
-sorting on `date + local_hour` instead (`local_hour_approx` for weather,
-since load_weather() has no exact local_hour): local_hour resets to 0
-exactly when `date` increments (that's what "local hour" means), so this
-is monotonic by construction across every local midnight, with one small
-known exception - the two days a year with a DST transition, where local
-wall-clock hours briefly skip or repeat. Not corrected for here, same
-"document the approximation" spirit as schema.md's own local_hour_approx
-note, and a far smaller issue than the bug it replaced (wrong every
-single day, not two days a year).
-
-NOTE: common/temporal_split.py is still an unsigned-off PROPOSAL as of
-this writing (see that file's own docstring) - Step 4 of this build
-sequence is blocked on Person A/Person B actually agreeing to it.
+Build (after both ASPM caches exist):
+    python -m features.tactical
 """
 
+import time
+
+import numpy as np
 import pandas as pd
 
-from common.data_loader import DATA_DIR, load_airport_analysis, load_bts, load_edct, load_weather
-from features.strategic import OPERATIONAL_NUMERIC_COLS, WEATHER_NUMERIC_COLS
+from common.aspm_cache import load_airport_analysis_cache, load_edct_cache
+from common.data_loader import DATA_DIR, load_weather
+from common.disruption import GDP_HOUR_SHARE_THRESHOLD, gdp_hours
+from common.temporal_split import TRAIN_END
+from features.planning import eligible_airports
 
-WINDOW_HOURS = 3  # matches TEAM_PLAN.md's "last 1-3h" near-term window
+TENSOR_PATH = DATA_DIR / "cache" / "tactical_tensor.npz"
+GRID = pd.date_range("2016-01-01 00:00", "2026-02-01 12:00", freq="h")
+MISSING_EDCT_MONTHS = ("2016-07", "2025-09")
 
-EDCT_NUMERIC_COLS = [
-    "arrivals_with_edct", "pct_arrivals_with_edct", "avg_edct_all_arrivals",
-    "avg_edct_arrivals_gt0", "arr_edct_late15_count", "arr_edct_late15_pct",
-    "departures_with_edct", "pct_departures_with_edct", "avg_edct_all_departures",
-    "avg_edct_departures_gt0", "dep_edct_late15_count", "dep_edct_late15_pct",
+FEATURE_NAMES = [
+    "hod_sin", "hod_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos",
+    "sched_arr_t", "sched_dep_t", "sched_arr_t1", "sched_arr_t2", "sched_dep_t1", "sched_dep_t2",
+    "arrivals_t", "pct_ontime_arr", "gate_arr_delay", "airborne_delay", "taxi_out_delay",
+    "gate_dep_delay", "airport_dep_delay",
+    "gate_arr_delay_m3", "gate_arr_delay_d3", "airborne_delay_m3", "airborne_delay_d3",
+    "taxi_out_delay_m3", "taxi_out_delay_d3",
+    "arr_edct_share", "dep_edct_share", "edct_delay_gt0", "gdp_hour_t", "gdp_hours_3h", "gdp_hours_24h",
+    "arr_edct_share_d3",
+    "wx_vsby", "wx_sknt", "wx_gust", "wx_ceiling", "wx_ts", "wx_spread", "wx_alti",
+    "wx_vsby_d3", "wx_ceiling_d3", "wx_alti_d3",
+    "climo_gdp_hour_rate",
 ]
 
 
-def _local_sort_key(dates: pd.Series, local_hours: pd.Series) -> pd.Series:
-    """Collapses (date, local_hour) into one sortable value, used
-    internally to put a single airport's rows in correct LOCAL
-    chronological order for rolling windows. Monotonic by construction:
-    local_hour resets to 0 exactly when date increments, unlike gmt_hour
-    (which wraps mid-day for any airport not at UTC+0 - see module
-    docstring). Never exposed in output tables, which keep
-    date/local_hour/gmt_hour as separate columns per schema.md's
-    convention."""
-    dates = pd.to_datetime(pd.Series(dates))
-    return dates + pd.to_timedelta(pd.Series(local_hours), unit="h")
+def _grid_index(utc: pd.Series) -> np.ndarray:
+    return GRID.get_indexer(pd.DatetimeIndex(utc))
 
 
-def _rolling_mean_and_delta(
-    frame: pd.DataFrame, value_cols: list[str], window_hours: int
-) -> pd.DataFrame:
-    """For a frame sorted by an hourly `_ts` column, computes per value
-    column: `{col}_rolling_mean` (trailing window_hours, current hour
-    included) and `{col}_rolling_delta` (that mean minus the mean of the
-    PRECEDING window of the same width) - the delta flags "getting worse
-    right now"."""
-    frame = frame.sort_values("_ts").reset_index(drop=True)
-    roll = frame[value_cols].rolling(window=window_hours, min_periods=1)
-    rolling_mean = roll.mean()
-    prev_rolling_mean = rolling_mean.shift(window_hours)
-    out = pd.DataFrame(index=frame.index)
-    for col in value_cols:
-        out[f"{col}_rolling_mean"] = rolling_mean[col]
-        out[f"{col}_rolling_delta"] = rolling_mean[col] - prev_rolling_mean[col]
+def _utc(df: pd.DataFrame) -> pd.Series:
+    offset = (df["gmt_hour"].astype(int) - df["local_hour"].astype(int)) % 24
+    return df["date"] + pd.to_timedelta(df["local_hour"].astype(int) + offset, unit="h")
+
+
+def _to_array(df: pd.DataFrame, col: str, ap_index: dict, fill=np.nan) -> np.ndarray:
+    out = np.full((len(ap_index), len(GRID)), fill, dtype=np.float32)
+    a = df["airport"].map(ap_index).to_numpy()
+    t = df["_t"].to_numpy()
+    ok = (t >= 0) & ~np.isnan(a.astype(float))
+    out[a[ok].astype(int), t[ok]] = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float32)[ok]
     return out
 
 
-def build_near_term_operational_features(
-    airport: str, year_months: list[tuple[int, int]], window_hours: int = WINDOW_HOURS
-) -> pd.DataFrame:
-    """One row per (date, local_hour, gmt_hour): ASPM Airport Analysis's
-    own airport-hour rows plus their rolling mean/delta over the trailing
-    `window_hours`."""
-    frames = [load_airport_analysis(year, month) for year, month in year_months]
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined[combined["airport"] == airport].copy()
-    combined["_ts"] = _local_sort_key(combined["date"], combined["local_hour"])
-    rolled = _rolling_mean_and_delta(combined, OPERATIONAL_NUMERIC_COLS, window_hours)
-    out = combined[["airport", "date", "local_hour", "gmt_hour"]].reset_index(drop=True)
-    return pd.concat([out, rolled], axis=1)
+def _shift(x: np.ndarray, k: int) -> np.ndarray:
+    """y[:, t] = x[:, t + k] (k > 0: future, k < 0: past), NaN off the ends."""
+    y = np.full_like(x, np.nan)
+    if k > 0:
+        y[:, :-k] = x[:, k:]
+    else:
+        y[:, -k:] = x[:, :k]
+    return y
 
 
-def build_near_term_edct_features(
-    airport: str, year_months: list[tuple[int, int]], window_hours: int = WINDOW_HOURS
-) -> pd.DataFrame:
-    """Same shape as build_near_term_operational_features, over EDCT
-    counts. Missing EDCT months are skipped with a warning, same
-    known-gap handling as features/strategic.py and features/planning.py."""
-    frames = []
-    for year, month in year_months:
-        path = DATA_DIR / "aspm_edct_report" / f"{year}_{month:02d}.xls"
-        if not path.exists():
-            print(f"build_near_term_edct_features: no EDCT file for {year}-{month:02d}, skipping (known gap)")
-            continue
-        edct = load_edct(year, month)
-        frames.append(edct[edct["airport"] == airport])
-
-    if not frames:
-        raise ValueError(f"no EDCT data available for airport {airport} in months {year_months}")
-
-    combined = pd.concat(frames, ignore_index=True).copy()
-    combined["_ts"] = _local_sort_key(combined["date"], combined["local_hour"])
-    rolled = _rolling_mean_and_delta(combined, EDCT_NUMERIC_COLS, window_hours)
-    out = combined[["airport", "date", "local_hour", "gmt_hour"]].reset_index(drop=True)
-    return pd.concat([out, rolled], axis=1)
+def _trailing_mean(x: np.ndarray, w: int) -> np.ndarray:
+    """mean of x[:, t-w+1 .. t], ignoring NaN. Cumulative sums in float64:
+    in float32 the rounding drift over ~88k hours is visible by 2019."""
+    v = np.nan_to_num(x).astype(np.float64)
+    n = (~np.isnan(x)).astype(np.float64)
+    cv = np.cumsum(v, axis=1)
+    cn = np.cumsum(n, axis=1)
+    sv = cv - np.concatenate([np.zeros((x.shape[0], w)), cv[:, :-w]], axis=1)
+    sn = cn - np.concatenate([np.zeros((x.shape[0], w)), cn[:, :-w]], axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(sn > 0, sv / sn, np.nan).astype(np.float32)
 
 
-def build_near_term_weather_features(
-    airport: str, window_hours: int = WINDOW_HOURS
-) -> pd.DataFrame:
-    """One row per (date, gmt_hour): METAR observations plus their
-    rolling mean/delta over the trailing `window_hours`. Sorted by
-    `local_hour_approx` (see module docstring), not `gmt_hour` -
-    load_weather() has no exact local_hour, but an approximate one is
-    still far more reliable for chronological ORDERING than gmt_hour,
-    which has a guaranteed daily discontinuity. Coerces the numeric
-    columns explicitly first, same fix as features/strategic.py's
-    build_recent_weather_features (IEM's "M" missing-observation sentinel
-    - see features/planning_features_validation.md, Issue 1)."""
-    wx = load_weather(airport).copy()
-    wx[WEATHER_NUMERIC_COLS] = wx[WEATHER_NUMERIC_COLS].apply(pd.to_numeric, errors="coerce")
-    wx["_ts"] = _local_sort_key(wx["date"], wx["local_hour_approx"])
-    rolled = _rolling_mean_and_delta(wx, WEATHER_NUMERIC_COLS, window_hours)
-    out = wx[["airport", "date", "gmt_hour"]].reset_index(drop=True)
-    return pd.concat([out, rolled], axis=1)
+def _delta3(x: np.ndarray) -> np.ndarray:
+    m = _trailing_mean(x, 3)
+    return (m - _shift(m, -3)).astype(np.float32)
 
 
-def _hhmm_to_hour(series: pd.Series) -> pd.Series:
-    """Converts a BTS hhmm-formatted time column (e.g. 1345, or 2400 for
-    midnight) into an integer local hour (0-23). Missing values
-    (cancelled/diverted flights have no ArrTime) come out as NaN."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    return (numeric // 100) % 24
-
-
-def build_lightweight_rotation_signal(
-    airport: str, year_months: list[tuple[int, int]], window_hours: int = WINDOW_HOURS
-) -> pd.DataFrame:
-    """One row per (date, local_hour): mean ArrDelay of flights that
-    landed at `airport` (BTS's `Dest`) in that local hour, plus a rolling
-    mean/delta over the trailing `window_hours` - a fast proxy for "is
-    inbound traffic currently backed up," deliberately NOT the full
-    rotation-chain graph (features/rotation_graph.py is Person B's shared
-    utility for that).
-
-    Cancelled and diverted flights are excluded (no real ArrDelay to
-    measure). Known approximation: BTS's FlightDate is the scheduled
-    DEPARTURE date, so a flight landing just after local midnight is
-    still bucketed under its departure day here rather than its true
-    arrival day - BTS exposes no separate arrival-date field. Already
-    sorts by local_hour - never had the gmt_hour bug the other three
-    builders did, since BTS has no gmt_hour equivalent to begin with."""
-    frames = [load_bts(year, month) for year, month in year_months]
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined[
-        (combined["Dest"] == airport)
-        & (combined["Cancelled"] != 1)
-        & (combined["Diverted"] != 1)
-    ].copy()
-
-    combined["local_hour"] = _hhmm_to_hour(combined["ArrTime"])
-    combined = combined.dropna(subset=["local_hour", "ArrDelay"])
-    combined["local_hour"] = combined["local_hour"].astype(int)
-    combined["date"] = pd.to_datetime(combined["FlightDate"])
-
-    hourly = (
-        combined.groupby(["date", "local_hour"])["ArrDelay"]
-        .mean()
-        .reset_index()
-        .rename(columns={"ArrDelay": "inbound_arr_delay"})
-    )
-    hourly["_ts"] = _local_sort_key(hourly["date"], hourly["local_hour"])
-    rolled = _rolling_mean_and_delta(hourly, ["inbound_arr_delay"], window_hours)
-    out = hourly[["date", "local_hour"]].reset_index(drop=True)
-    out.insert(0, "airport", airport)
-    return pd.concat([out, rolled], axis=1)
-
-
-def build_tactical_features(
-    airport: str,
-    year_months: list[tuple[int, int]],
-    window_hours: int = WINDOW_HOURS,
-) -> pd.DataFrame:
-    """Assembles the near-term operational, EDCT, weather, and rotation
-    feature groups into one table keyed by (airport, date, local_hour,
-    gmt_hour). Weather is joined on (airport, date, gmt_hour) only, since
-    load_weather() doesn't expose local_hour. The rotation signal is
-    joined on (airport, date, local_hour) instead - BTS gives no
-    gmt_hour equivalent directly - so rows where BTS has no inbound
-    traffic that hour come out with NaN rotation features, which is
-    correct (not missing data, just genuinely no inbound flights)."""
-    operational = build_near_term_operational_features(airport, year_months, window_hours)
-    edct = build_near_term_edct_features(airport, year_months, window_hours)
-    weather = build_near_term_weather_features(airport, window_hours)
-    rotation = build_lightweight_rotation_signal(airport, year_months, window_hours)
-
-    out = operational.merge(
-        edct, on=["airport", "date", "local_hour", "gmt_hour"], how="left", suffixes=("", "_edct")
-    )
-    out = out.merge(
-        weather, on=["airport", "date", "gmt_hour"], how="left", suffixes=("", "_wx")
-    )
-    out = out.merge(
-        rotation, on=["airport", "date", "local_hour"], how="left", suffixes=("", "_rot")
-    )
+def _weather(airports: list[str]) -> dict[str, np.ndarray]:
+    names = ["vsby", "sknt", "gust", "ceiling", "ts", "spread", "alti"]
+    out = {n: np.full((len(airports), len(GRID)), np.nan, np.float32) for n in names}
+    for i, airport in enumerate(airports):
+        wx = load_weather(airport)
+        valid = pd.to_datetime(wx["date"]) + pd.to_timedelta(wx["gmt_hour"], unit="h")
+        num = wx[["tmpf", "dwpf", "sknt", "gust", "vsby", "alti"]].apply(pd.to_numeric, errors="coerce")
+        ceil = np.full(len(wx), np.nan)
+        for k in (3, 2, 1):  # lowest broken/overcast/obscured layer wins
+            cover = wx[f"skyc{k}"].astype(str).str.strip()
+            height = pd.to_numeric(wx[f"skyl{k}"], errors="coerce").to_numpy()
+            layer = cover.isin(["BKN", "OVC", "VV"]).to_numpy()
+            ceil = np.where(layer & ~np.isnan(height), height, ceil)
+        df = pd.DataFrame({
+            "t": GRID.get_indexer(pd.DatetimeIndex(valid)),
+            "vsby": num["vsby"], "sknt": num["sknt"], "gust": num["gust"].fillna(num["sknt"]),
+            "ceiling": np.where(np.isnan(ceil), 12000.0, np.minimum(ceil, 12000.0)),
+            "ts": wx["wxcodes"].astype(str).str.contains("TS", na=False).astype(float),
+            "spread": num["tmpf"] - num["dwpf"], "alti": num["alti"],
+        })
+        df = df[df["t"] >= 0]
+        g = df.groupby("t").agg(vsby=("vsby", "min"), sknt=("sknt", "max"), gust=("gust", "max"),
+                                ceiling=("ceiling", "min"), ts=("ts", "max"), spread=("spread", "mean"),
+                                alti=("alti", "mean"))
+        for n in names:
+            out[n][i, g.index.to_numpy()] = g[n].to_numpy(dtype=np.float32)
     return out
+
+
+def build_tensor(share_threshold: float = GDP_HOUR_SHARE_THRESHOLD) -> dict:
+    t0 = time.time()
+    airports = eligible_airports()
+    ap = {a: i for i, a in enumerate(airports)}
+    A, T = len(airports), len(GRID)
+
+    aa = load_airport_analysis_cache(["airport", "date", "local_hour", "gmt_hour", "scheduled_arrivals",
+                                      "scheduled_departures", "arrivals_for_metric", "pct_ontime_gate_arr",
+                                      "avg_gate_arr_delay", "avg_airborne_delay", "avg_taxi_out_delay",
+                                      "avg_gate_dep_delay", "avg_airport_dep_delay"])
+    aa = aa[aa["airport"].isin(ap)]
+    aa["_t"] = _grid_index(_utc(aa))
+    local_hour = _to_array(aa, "local_hour", ap)
+    offset = np.full((A, T), np.nan, np.float32)
+    off = (aa["gmt_hour"].astype(int) - aa["local_hour"].astype(int)) % 24
+    offset[aa["airport"].map(ap).to_numpy(), aa["_t"].to_numpy()] = off.to_numpy(dtype=np.float32)
+    offset = pd.DataFrame(offset.T).ffill().bfill().to_numpy().T  # hours absent from ASPM
+    local_ts = GRID.to_numpy()[None, :] - (offset.astype("int64") * 3600 * 10**9).astype("timedelta64[ns]")
+    local_hour = pd.DatetimeIndex(local_ts.ravel()).hour.to_numpy().reshape(A, T)
+    local_dow = pd.DatetimeIndex(local_ts.ravel()).dayofweek.to_numpy().reshape(A, T)
+    local_doy = pd.DatetimeIndex(local_ts.ravel()).dayofyear.to_numpy().reshape(A, T)
+    local_month = pd.DatetimeIndex(local_ts.ravel()).month.to_numpy().reshape(A, T)
+    print(f"  ASPM loaded and aligned ({time.time() - t0:.0f}s)", flush=True)
+
+    sched_arr = np.nan_to_num(_to_array(aa, "scheduled_arrivals", ap))
+    sched_dep = np.nan_to_num(_to_array(aa, "scheduled_departures", ap))
+    f = {}
+    f["hod_sin"], f["hod_cos"] = np.sin(2 * np.pi * local_hour / 24), np.cos(2 * np.pi * local_hour / 24)
+    f["dow_sin"], f["dow_cos"] = np.sin(2 * np.pi * local_dow / 7), np.cos(2 * np.pi * local_dow / 7)
+    f["doy_sin"], f["doy_cos"] = np.sin(2 * np.pi * local_doy / 365.25), np.cos(2 * np.pi * local_doy / 365.25)
+    f["sched_arr_t"], f["sched_dep_t"] = sched_arr, sched_dep
+    f["sched_arr_t1"], f["sched_arr_t2"] = _shift(sched_arr, 1), _shift(sched_arr, 2)
+    f["sched_dep_t1"], f["sched_dep_t2"] = _shift(sched_dep, 1), _shift(sched_dep, 2)
+    f["arrivals_t"] = np.nan_to_num(_to_array(aa, "arrivals_for_metric", ap))
+    f["pct_ontime_arr"] = _to_array(aa, "pct_ontime_gate_arr", ap)
+    for src, name in (("avg_gate_arr_delay", "gate_arr_delay"), ("avg_airborne_delay", "airborne_delay"),
+                      ("avg_taxi_out_delay", "taxi_out_delay"), ("avg_gate_dep_delay", "gate_dep_delay"),
+                      ("avg_airport_dep_delay", "airport_dep_delay")):
+        f[name] = _to_array(aa, src, ap)
+    for name in ("gate_arr_delay", "airborne_delay", "taxi_out_delay"):
+        f[f"{name}_m3"], f[f"{name}_d3"] = _trailing_mean(f[name], 3), _delta3(f[name])
+    del aa
+
+    e = load_edct_cache(["airport", "date", "local_hour", "gmt_hour", "arrivals_for_metric", "arrivals_with_edct",
+                         "departures_for_metric", "departures_with_edct", "avg_edct_arrivals_gt0"])
+    e = e[e["airport"].isin(ap)]
+    e["_t"] = _grid_index(_utc(e))
+    e["arr_share"] = e["arrivals_with_edct"] / e["arrivals_for_metric"].replace(0, np.nan)
+    e["dep_share"] = e["departures_with_edct"] / e["departures_for_metric"].replace(0, np.nan)
+    known = np.ones((A, T), bool)
+    for m in MISSING_EDCT_MONTHS:
+        known[:, (GRID.strftime("%Y-%m") == m)] = False
+    f["arr_edct_share"] = np.where(known, np.nan_to_num(_to_array(e, "arr_share", ap)), np.nan)
+    f["dep_edct_share"] = np.where(known, np.nan_to_num(_to_array(e, "dep_share", ap)), np.nan)
+    f["edct_delay_gt0"] = np.where(known, np.nan_to_num(_to_array(e, "avg_edct_arrivals_gt0", ap)), np.nan)
+    gh = gdp_hours(share_threshold)
+    gh = gh[gh["airport"].isin(ap)].merge(e[["airport", "date", "local_hour", "_t"]],
+                                         on=["airport", "date", "local_hour"])
+    gdp = np.where(known, np.nan_to_num(_to_array(gh, "gdp_hour", ap)), np.nan).astype(np.float32)
+    del e, gh
+    f["gdp_hour_t"] = gdp
+    f["gdp_hours_3h"] = _trailing_mean(gdp, 3) * 3
+    f["gdp_hours_24h"] = _trailing_mean(gdp, 24) * 24
+    f["arr_edct_share_d3"] = _delta3(f["arr_edct_share"])
+    print(f"  EDCT done ({time.time() - t0:.0f}s)", flush=True)
+
+    wx = _weather(airports)
+    for n in ("vsby", "sknt", "gust", "ceiling", "ts", "spread", "alti"):
+        f[f"wx_{n}"] = wx[n]
+    for n in ("vsby", "ceiling", "alti"):
+        f[f"wx_{n}_d3"] = _delta3(wx[n])
+    print(f"  weather done ({time.time() - t0:.0f}s)", flush=True)
+
+    train = (GRID <= pd.Timestamp(TRAIN_END) + pd.Timedelta(hours=23))[None, :] & ~np.isnan(gdp)
+    climo = np.full((A, T), np.nan, np.float32)
+    for i in range(A):
+        key = local_month[i] * 24 + local_hour[i]
+        s = pd.Series(gdp[i][train[i]]).groupby(key[train[i]]).mean()
+        climo[i] = s.reindex(key).to_numpy(dtype=np.float32)
+    f["climo_gdp_hour_rate"] = climo
+
+    nxt1, nxt2 = _shift(gdp, 1), _shift(gdp, 2)
+    any_gdp = (nxt1 == 1) | (nxt2 == 1)
+    all_known = ~np.isnan(nxt1) & ~np.isnan(nxt2)
+    label = np.where(any_gdp, 1.0, np.where(all_known, 0.0, np.nan)).astype(np.float32)
+    open_ = (f["sched_arr_t1"] + f["sched_arr_t2"]) > 0
+    label = np.where(open_, label, np.nan).astype(np.float32)
+
+    X = np.stack([f[n].astype(np.float32) for n in FEATURE_NAMES], axis=2)
+    print(f"  tensor {X.shape} built in {time.time() - t0:.0f}s", flush=True)
+    return {"X": X, "label": label, "gdp_hour": gdp, "airports": np.array(airports), "grid": GRID.to_numpy(),
+            "feature_names": np.array(FEATURE_NAMES)}
+
+
+if __name__ == "__main__":
+    t = build_tensor()
+    np.savez(TENSOR_PATH, **t)
+    lab = t["label"]
+    print(f"saved {TENSOR_PATH}: scored airport-hours {int((~np.isnan(lab)).sum()):,}, "
+          f"positive {np.nanmean(lab):.4f}, onset rows (not in GDP now) "
+          f"{int(((~np.isnan(lab)) & (t['gdp_hour'] == 0)).sum()):,}")

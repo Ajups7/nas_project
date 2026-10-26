@@ -1,60 +1,70 @@
 """
-Validates strategic.py against REAL downloaded data (same approach as
-validate_planning_features.py - the data already exists locally).
+Validates features/strategic.py against REAL data, with emphasis on timing
+(the original version had a one-day gap between features and label).
 
-Runs on airport ATL, June 1-10 2023, deliberately spanning a month
-boundary (June 1's "yesterday" is May 31) to exercise the cross-month
-shift in build_strategic_features, and including one EDCT-known-gap-
-adjacent case is not needed here since 2023 isn't one of the 2 gap months
-(2016-07, 2025-09) - both required (year, month) pairs are real data.
-
-Run from the repo root:
+Run from the repo root (after `python -m features.strategic`):
     python -m features.validate_strategic_features
 """
 
+import numpy as np
 import pandas as pd
 
-from features.strategic import (
-    build_recent_disruption_features,
-    build_recent_operational_features,
-    build_recent_weather_features,
-    build_strategic_features,
-)
+from common.aspm_cache import load_airport_analysis_cache
+from common.disruption import gdp_days
+from common.temporal_split import TRAIN_END
+from features.strategic import DAILY_PATH, FEATURE_COLUMNS, LABELS_PATH
+from models.strategic.data import load_strategic_splits
 
-AIRPORT = "ATL"
-DATES = pd.date_range("2023-06-01", "2023-06-10")
-YEAR_MONTHS = [(2023, 5), (2023, 6)]  # May needed for June 1's "yesterday"
+AIRPORT, DAY = "EWR", pd.Timestamp("2019-07-15")
+
+
+def ok(flag: bool) -> str:
+    return "OK" if flag else "MISMATCH"
 
 
 def main():
-    print(f"=== Recent operational features, {AIRPORT}, {YEAR_MONTHS} ===")
-    operational = build_recent_operational_features(AIRPORT, YEAR_MONTHS)
-    print(operational[operational["date"].dt.month == 6].head(3).to_string(index=False))
+    daily = pd.read_parquet(DAILY_PATH)
+    labels = pd.read_parquet(LABELS_PATH)
+    row = daily[(daily["airport"] == AIRPORT) & (daily["date"] == DAY)].iloc[0]
+    nxt = daily[(daily["airport"] == AIRPORT) & (daily["date"] == DAY + pd.Timedelta(days=1))].iloc[0]
 
-    print()
-    print(f"=== Recent disruption features, {AIRPORT}, {YEAR_MONTHS} ===")
-    disruption = build_recent_disruption_features(AIRPORT, YEAR_MONTHS)
-    print(disruption[disruption["date"].dt.month == 6].head(3).to_string(index=False))
+    print(f"=== 1. Row {DAY.date()} carries day {DAY.date()}'s operations (not the day before) ===")
+    aa = load_airport_analysis_cache(["airport", "date", "avg_gate_arr_delay", "scheduled_arrivals"])
+    aa = aa[aa["airport"] == AIRPORT]
+    same_day = pd.to_numeric(aa.loc[aa["date"] == DAY, "avg_gate_arr_delay"]).mean()
+    prev_day = pd.to_numeric(aa.loc[aa["date"] == DAY - pd.Timedelta(days=1), "avg_gate_arr_delay"]).mean()
+    print(f"  ops_avg_gate_arr_delay={row['ops_avg_gate_arr_delay']:.3f}  same day={same_day:.3f}  "
+          f"previous day={prev_day:.3f}  [{ok(np.isclose(row['ops_avg_gate_arr_delay'], same_day))}]")
 
-    print()
-    print(f"=== Recent weather features, {AIRPORT}, {DATES.min()} - {DATES.max()} ===")
-    weather = build_recent_weather_features(AIRPORT, DATES - pd.Timedelta(days=1))
-    print(weather.to_string(index=False))
+    print("\n=== 2. Tomorrow's schedule = the next row's own schedule ===")
+    print(f"  sched_arr_tomorrow={row['sched_arr_tomorrow']:.0f}  next row sched_arr_today="
+          f"{nxt['sched_arr_today']:.0f}  [{ok(row['sched_arr_tomorrow'] == nxt['sched_arr_today'])}]")
 
-    print()
-    print(f"=== Full assembly: build_strategic_features, {AIRPORT}, {DATES.min().date()} - {DATES.max().date()} ===")
-    full = build_strategic_features(AIRPORT, DATES, YEAR_MONTHS)
-    print(full.to_string(index=False))
-    print()
-    print("Missing values per column (June 1 depends on May 31 - checking the cross-month shift actually pulled real data, not NaN):")
-    print(full.isna().sum().to_string())
+    print("\n=== 3. Label is D+1's GDP flag; features hold only D and earlier ===")
+    merged = labels.merge(daily[["airport", "date", "gdp_day_today"]], on=["airport", "date"])
+    g = gdp_days()
+    nextday = np.array([g.at[d + pd.Timedelta(days=1), a] for a, d in
+                        zip(merged["airport"].iloc[:20000], merged["date"].iloc[:20000])])
+    print(f"  label == gdp_days(D+1) on first 20,000 rows: "
+          f"[{ok(np.array_equal(merged['label'].iloc[:20000].to_numpy(), nextday))}]")
+    same = (merged["label"] == merged["gdp_day_today"]).mean()
+    print(f"  label equals today's GDP flag on {same:.1%} of rows (persistence, not identity)")
 
-    print()
-    print("Manual cross-check: June 2's recent_disruption_rate should equal June 1's raw disruption_rate")
-    june1_raw = disruption[disruption["date"] == pd.Timestamp("2023-06-01")]
-    print(f"  raw June 1 recent_disruption_rate row: {june1_raw['recent_disruption_rate'].values}")
-    june2_feature = full[full["date"] == pd.Timestamp("2023-06-02")]["recent_disruption_rate"].values
-    print(f"  build_strategic_features June 2 row's recent_disruption_rate: {june2_feature}")
+    print("\n=== 4. Climatology uses train dates only ===")
+    train = g[AIRPORT].loc[:TRAIN_END]
+    expect = train[train.index.month == 7].mean()
+    print(f"  climo for {AIRPORT}, target in July={row['climo_gdp_day_rate_target']:.4f}  "
+          f"by hand={expect:.4f}  [{ok(np.isclose(row['climo_gdp_day_rate_target'], expect))}]")
+
+    print("\n=== 5. Dataset ===")
+    print(f"  daily rows {len(daily):,}, labeled rows {len(labels):,}, airports {daily['airport'].nunique()}")
+    print(labels.groupby("split")["label"].agg(["size", "mean"]).round(4).to_string())
+    miss = daily.loc[daily["date"] <= TRAIN_END, FEATURE_COLUMNS].isna().mean()
+    print("  missing before fill (train-period days):")
+    print(miss[miss > 0].round(4).to_string())
+    tr = load_strategic_splits()["train"]
+    print("  correlation with label (train, after fill):")
+    print(tr[FEATURE_COLUMNS].corrwith(tr["label"]).round(3).sort_values().to_string())
 
 
 if __name__ == "__main__":

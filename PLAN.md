@@ -69,8 +69,15 @@ baselines solid before layering in the novel components in Phase 3.
    Applied throughout Phases 2-3, formalized once the model set is stable.
    Status: NOT STARTED.
 
-## Current position
+## Current position (2026-10-23)
 
-Still inside Phase 1. Real gaps against the original plan: the ASPM Advisories
-login request (item 2) and NOAA weather data (item 3) haven't been started.
-Once those are in hand, Phase 2 (baseline models) is the next milestone.
+Phases 2–4 have been run for all three tiers and each tier's test set
+evaluated once — see [RESULTS.md](RESULTS.md). The item statuses above
+predate that and are kept as history. What changed against this plan:
+
+- Item 2 (ASPM Advisories) never arrived: every label is a GDP-only proxy
+  from the ASPM EDCT report (`common/disruption.py`).
+- Item 3 (weather): METAR observations were downloaded and used; NOAA
+  HRRR/NEXRAD forecasts were not.
+- Items 4–8 are done; results and decisions per tier in
+  `models/{planning,strategic,tactical}/training_results.md`.

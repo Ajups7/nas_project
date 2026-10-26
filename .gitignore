@@ -11,3 +11,9 @@ __pycache__/
 venv/
 scripts/__pycache__/
 
+
+# Shared-disk symlink, run logs, and large regenerable prediction files
+data
+logs/
+models/*/results/predictions/
+models/*/results/*.parquet

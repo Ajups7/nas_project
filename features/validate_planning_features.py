@@ -1,72 +1,85 @@
 """
-Validates planning.py against REAL downloaded data (unlike the losses/ and
-models/planning/ validations, which used synthetic inputs - there's real
-BTS/ASPM/EDCT/METAR data to check this against, so this uses it).
+Validates planning.py against REAL data, recomputing each feature group by
+hand and checking the leakage guarantee directly.
 
-Runs on airport ATL, full 2016-2026 METAR history for weather climatology
-(fast - one file per airport), but only a 6-month SAMPLE for disruption
-climatology (3 Januaries + 3 Julys across different years) rather than the
-full 119-month history - see planning_features_validation.md for why:
-load_edct() takes ~15s/month, so the full history takes ~30 minutes and
-should be run once as a batch/cache job, not inside a quick validation run.
-
-Run from the repo root:
+Run from the repo root (after `python -m features.planning` has built the cache):
     python -m features.validate_planning_features
 """
 
-import time
-
+import numpy as np
 import pandas as pd
 
+from common.data_loader import load_weather
+from common.disruption import gdp_days
+from common.temporal_split import TRAIN_END
 from features.planning import (
-    build_calendar_features,
-    build_disruption_climatology,
+    ANOMALY_COLUMNS,
+    DATASET_PATH,
+    FEATURE_COLUMNS,
     build_planning_features,
-    build_weather_climatology,
 )
 
-AIRPORT = "ATL"
-# Deliberately includes (2016, 7), one of the 2 documented gaps in the EDCT
-# download (README.md, "119/121 months") - this doubles as a test that
-# build_disruption_climatology skips missing months gracefully.
-SAMPLE_EDCT_MONTHS = [(2016, 1), (2019, 1), (2022, 1), (2016, 7), (2019, 7), (2022, 7)]
+AIRPORT = "SFO"
 
 
 def main():
-    print("=== Calendar features (pure date arithmetic, no data loading) ===")
-    dates = pd.date_range("2024-01-01", "2024-01-07")
-    calendar = build_calendar_features(dates)
-    print(calendar.to_string(index=False))
-    print()
-    print("Sanity check - day_of_year_sin/cos should each stay in [-1, 1]:")
-    print(f"  sin range: [{calendar['day_of_year_sin'].min():.3f}, {calendar['day_of_year_sin'].max():.3f}]")
-    print(f"  cos range: [{calendar['day_of_year_cos'].min():.3f}, {calendar['day_of_year_cos'].max():.3f}]")
+    gdp = gdp_days()[AIRPORT]
+    train_gdp = gdp.loc[:TRAIN_END]
 
-    print()
-    print(f"=== Weather climatology for {AIRPORT}, full 2016-2026 history ===")
-    t0 = time.time()
-    weather_clim = build_weather_climatology(AIRPORT)
-    elapsed = time.time() - t0
-    print(f"(computed in {elapsed:.1f}s, from the full downloaded METAR history)")
-    print(weather_clim[["airport", "month", "climo_tmpf", "climo_sknt", "climo_vsby"]].to_string(index=False))
+    print("=== 1. Forward-window climatology: 2019-06-25 covers Jun 26-30 + Jul 1-25 ===")
+    month_rate = train_gdp.groupby(train_gdp.index.month).mean()
+    expected = (5 * month_rate[6] + 25 * month_rate[7]) / 30
+    f = build_planning_features(AIRPORT, pd.to_datetime(["2019-06-25"]))
+    print(f"  climo_gdp_day_rate={f['climo_gdp_day_rate'].iloc[0]:.5f}  by hand={expected:.5f}  "
+          f"[{'OK' if np.isclose(f['climo_gdp_day_rate'].iloc[0], expected) else 'MISMATCH'}]")
 
-    print()
-    print(f"=== Disruption climatology for {AIRPORT}, SAMPLE of 6/119 months ===")
-    print(f"months used: {SAMPLE_EDCT_MONTHS}")
-    t0 = time.time()
-    disruption_clim = build_disruption_climatology(AIRPORT, SAMPLE_EDCT_MONTHS)
-    elapsed = time.time() - t0
-    print(f"(computed in {elapsed:.1f}s for 6 months -> "
-          f"projects to roughly {elapsed / 6 * 119 / 60:.0f} minutes for the full 119-month history)")
-    print(disruption_clim.to_string(index=False))
+    wx = load_weather(AIRPORT)
+    wx = wx[wx["date"] <= TRAIN_END]
+    tmpf = pd.to_numeric(wx["tmpf"], errors="coerce").groupby(wx["date"].dt.month).mean()
+    expected_t = (5 * tmpf[6] + 25 * tmpf[7]) / 30
+    print(f"  climo_tmpf={f['climo_tmpf'].iloc[0]:.3f}  by hand={expected_t:.3f}  "
+          f"[{'OK' if np.isclose(f['climo_tmpf'].iloc[0], expected_t) else 'MISMATCH'}]")
 
-    print()
-    print("=== Full assembly: build_planning_features (same sample months) ===")
-    dates = pd.date_range("2024-01-01", "2024-01-05")
-    full = build_planning_features(AIRPORT, dates, SAMPLE_EDCT_MONTHS)
-    print(full.to_string(index=False))
-    print()
-    print(f"No missing values after merge: {not full.isna().any().any()}")
+    print("\n=== 2. Leakage: climatology must not change if post-train GDPs change ===")
+    d = pd.to_datetime(["2024-07-01"])
+    before = build_planning_features(AIRPORT, d)["climo_gdp_day_rate"].iloc[0]
+    days = gdp_days()
+    saved = days.loc[pd.Timestamp(TRAIN_END) + pd.Timedelta(days=1):, AIRPORT].copy()
+    days.loc[pd.Timestamp(TRAIN_END) + pd.Timedelta(days=1):, AIRPORT] = 1.0
+    after = build_planning_features(AIRPORT, d)["climo_gdp_day_rate"].iloc[0]
+    days.loc[saved.index, AIRPORT] = saved
+    print(f"  2024-07-01 climo before={before:.5f} after setting every post-train day to GDP={after:.5f}  "
+          f"[{'OK' if before == after else 'LEAK'}]")
+
+    print("\n=== 3. Recent history: 2019-07-15, past 7 and 30 days through the date itself ===")
+    f = build_planning_features(AIRPORT, pd.to_datetime(["2019-07-15"]))
+    exp7 = gdp.loc["2019-07-09":"2019-07-15"].mean()
+    exp30 = gdp.loc["2019-06-16":"2019-07-15"].mean()
+    print(f"  7d={f['recent_gdp_rate_7d'].iloc[0]:.4f} by hand={exp7:.4f}   "
+          f"30d={f['recent_gdp_rate_30d'].iloc[0]:.4f} by hand={exp30:.4f}  "
+          f"[{'OK' if np.isclose(f['recent_gdp_rate_7d'].iloc[0], exp7) and np.isclose(f['recent_gdp_rate_30d'].iloc[0], exp30) else 'MISMATCH'}]")
+    print("  (window ends at the as-of date; the label window starts the day after - no overlap)")
+    exp_anom = exp30 - (15 * month_rate[6] + 15 * month_rate[7]) / 30  # Jun 16-30 + Jul 1-15
+    got_anom = f["recent_gdp_anom_30d"].iloc[0]
+    print(f"  anom30={got_anom:.4f} by hand={exp_anom:.4f}  "
+          f"[{'OK' if np.isclose(got_anom, exp_anom) else 'MISMATCH'}]")
+
+    print("\n=== 4. Cached all-airport dataset ===")
+    df = pd.read_parquet(DATASET_PATH)
+    print(f"  rows {len(df):,}, airports {df['airport'].nunique()}")
+    print("  rows / label prevalence by split:")
+    print(df.groupby("split")["label"].agg(["size", "mean"]).round(3).to_string())
+    print("  missing values per feature (train rows):")
+    na = df.loc[df["split"] == "train", FEATURE_COLUMNS].isna().mean()
+    print(na[na > 0].round(4).to_string() if (na > 0).any() else "  none")
+    tr = df[df["split"] == "train"]
+    prev = tr.groupby("airport")["label"].mean()
+    print(f"  per-airport train prevalence (median is unstable - bimodal): "
+          f"quartiles {prev.quantile([.25, .5, .75]).round(3).tolist()}, "
+          f">=0.95: {(prev >= 0.95).sum()}, <=0.05: {(prev <= 0.05).sum()}, "
+          f"between: {((prev > 0.05) & (prev < 0.95)).sum()}")
+    print("  feature correlation with label (train):")
+    print(tr[FEATURE_COLUMNS + ANOMALY_COLUMNS].corrwith(tr["label"]).round(3).sort_values().to_string())
 
 
 if __name__ == "__main__":
