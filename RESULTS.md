@@ -1,8 +1,10 @@
 # NAS-DisruptNet: results across the three tiers
 
-All numbers are **test-set** (as-of dates 2024-03 → 2025-12/2026-01), each
-tier evaluated **once** after its choices were frozen; mean of 3 seeds for
-neural models. Details, validation results and every decision behind them:
+All numbers are **test-set**: forecasts made from 2024-03-01 to the last
+date whose outcome is known (2026-01-01 for Planning, 2026-01-30 for
+Strategic, end of January 2026 for Tactical; data ends 2026-01-31). Each
+tier was evaluated **once**, after its choices were frozen. Neural models:
+mean of 3 training runs with different random starts (± = their spread). Details, validation results and every decision behind them:
 
 - Planning (1–30 days): [`models/planning/training_results.md`](models/planning/training_results.md)
 - Strategic (2–24 hours): [`models/strategic/training_results.md`](models/strategic/training_results.md)
